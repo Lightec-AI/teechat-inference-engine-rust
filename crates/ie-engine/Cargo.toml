@@ -1,0 +1,19 @@
+[package]
+name = "ie-engine"
+description = "Supervised engine plane pool, epoch, and inference orchestration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+ie-attestation = { workspace = true }
+ie-protocol = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

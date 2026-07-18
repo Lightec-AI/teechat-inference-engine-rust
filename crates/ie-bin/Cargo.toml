@@ -1,0 +1,23 @@
+[package]
+name = "ie-bin"
+description = "TeeChat InferenceEngine binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "teechat-inference-engine"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+ie-attestation = { workspace = true }
+ie-engine = { workspace = true }
+ie-protocol = { workspace = true }
+ie-runtime = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

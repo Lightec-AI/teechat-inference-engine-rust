@@ -1,0 +1,20 @@
+[package]
+name = "ie-crypto"
+description = "OPE E2E / envelope wrappers for TeeChat InferenceEngine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["ope"]
+ope = ["dep:ope-crypto", "dep:ope-envelope", "dep:ope-transport", "dep:ope-e2e"]
+
+[dependencies]
+ie-protocol = { workspace = true }
+thiserror = { workspace = true }
+ope-crypto = { workspace = true, optional = true }
+ope-envelope = { workspace = true, optional = true }
+ope-transport = { workspace = true, optional = true }
+ope-e2e = { workspace = true, optional = true }

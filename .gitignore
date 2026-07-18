@@ -1,0 +1,9 @@
+/target/
+**/*.rs.bk
+Cargo.lock
+.env
+.env.local
+.env.staging
+native/
+*.so
+.DS_Store

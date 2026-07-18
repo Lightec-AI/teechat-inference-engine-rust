@@ -1,0 +1,22 @@
+{
+  "schema": "teechat-inference-engine-tcb-pins/v1",
+  "ope": {
+    "version": "0.1.0",
+    "tag": "v0.1.0",
+    "npmWasm": "@teechat/ope-wasm@0.1.0",
+    "libopeFfiSha256": "0803b3cb08bd9ce5b01dbfb6d57661a0d29e5b9cf460e38de10ee9d437465623",
+    "assetUrl": "https://github.com/Lightec-AI/OPE/releases/download/v0.1.0/libope_ffi.so",
+    "gitSha": "ffbee812e32a880bd61ed227271d98465f6bb0cb",
+    "notes": "Measured Node FFI is the OPE GitHub Release libope_ffi.so (re-attached on IE tags)."
+  },
+  "attestedMtls": {
+    "version": "0.1.0",
+    "tag": "v0.1.0",
+    "npmNode": "@teechat/attested-mtls-node@0.1.0",
+    "npmWasm": "@teechat/attested-mtls@0.1.0",
+    "libAttestedMtlsSha256": "ca5324d6261218c61fab6a88a913a8370c9c4f4d324e451c99490099ea11128a",
+    "assetUrl": "https://github.com/Lightec-AI/teechat-attested-mtls/releases/download/v0.1.0/libattested_mtls.so",
+    "gitSha": "e482a8a4c3aeaf7a5e29d57bfaa404d89e61787a",
+    "notes": "Node uses npm bindings + ATTESTED_MTLS_LIB_PATH (or fetched native/). Measured .so is the GitHub Release asset."
+  }
+}

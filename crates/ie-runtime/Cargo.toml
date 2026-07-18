@@ -1,0 +1,16 @@
+[package]
+name = "ie-runtime"
+description = "InferenceEngine runtime: env load and attested-mtls TLS material"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+attested-mtls = { workspace = true }
+ie-attestation = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
