@@ -18,10 +18,12 @@ This document tracks what is ported in **teechat-inference-engine-rust** and wha
 | `src/runtime/load-env.ts` | `crates/ie-runtime/src/env.rs` | **Ported** |
 | `src/runtime/engine-tls.ts` | `crates/ie-runtime/src/tls.rs` | **Ported** — via `attested-mtls` |
 | `src/native/ope-ffi.ts`, `src/crypto/provider.ts` | `crates/ie-crypto` | **Partial** — crate wrappers; no FFI load path yet |
+| `src/engine-plane/pool-client.ts` | `crates/ie-engine/src/plane` | **Partial** — dial/connect/disconnect/ephemeral + hyper+rustls transport; work-pull / infer loop TODO |
+| `src/engine/gateway-connect-nonce.ts` | `ie-engine::plane::challenge` | **Ported** — generate/normalize; nonce-echo verifier stub (full SEC-029 quote verify deferred) |
 | `src/engine/supervised-pool.ts` | `crates/ie-engine` | **Partial** — config, traits, pool skeleton + tests |
 | `src/engine/epoch*.ts`, `rotating-decryptor.ts` | — | TODO |
 | `src/engine/pool-*.ts`, `gateway-migration*.ts` | — | TODO |
-| `src/engine-plane/pool-client.ts` | `ie-engine::EnginePlaneConnector` trait | TODO — HTTP/2 attested TLS dial |
+| `src/engine-plane/pool-client.ts` work-pull | `ie-engine::EnginePlaneConnector` trait | TODO — HTTP/2 work-pull loop |
 | `src/upstream/vllm-chat.ts` | `crates/ie-upstream` | **Partial** — POST + SSE stream skeleton, body builders |
 | `src/server/ope-inference.ts` | — | TODO — decrypt → vLLM → encrypt handler |
 | `src/metering.ts`, `src/prefill.ts` | — | TODO |
@@ -36,13 +38,20 @@ This document tracks what is ported in **teechat-inference-engine-rust** and wha
 
 ## Remaining work (priority)
 
-1. **Engine-plane HTTP/2 client** — attested TLS connect/disconnect/work-pull (`pool-client.ts`).
+1. **Work-pull + infer loop** — `startPullWorker` parity on attested H2 session.
 2. **OPE inference path** — wire `ope-e2e` decrypt + response encrypt in a Tokio handler.
-3. **SEV-SNP production backend** — guest report + quote wrapper encoding.
+3. **SEV-SNP production backend** — guest report + quote wrapper encoding; full SEC-029 platform verify.
 4. **Attestation verification** — policy file, GPU NV-CC, gateway platform verify.
 5. **Supervised pool parity** — epoch rotation, reconnect attestation refresh, blue/green cutover.
-6. **Integration tests** — golden vectors from TS `test/` against Rust crates.
+6. **Integration tests** — golden vectors from TS `test/` against Rust crates; live TLS+H2 mock gateway.
 7. **Runtime packaging** — RELEASE_MANIFEST, native `.so` fetch scripts mirroring TS `scripts/`.
+
+## Done in this milestone
+
+- `open_pooled_connection` / `graceful_disconnect` / `post_ephemeral` with `PlaneTransport` abstraction
+- `Http2EnginePlaneConnector` (hyper HTTP/2 + rustls mTLS, ALPN `h2`)
+- Challenge nonce helpers + nonce-echo gateway verifier stub
+- Unit tests without live gateway (12 `ie-engine` tests)
 
 ## CLI parity
 

@@ -22,13 +22,24 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 futures = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 sha2 = "0.10"
 hex = "0.4"
 async-trait = "0.1"
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "server-auto", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+rand = "0.8"
 attested-mtls = "0.1.0"
 ope-crypto = "0.1.0"
 ope-envelope = "0.1.0"
