@@ -1,0 +1,57 @@
+# Tag release: build measured Rust InferenceEngine linux-amd64 runtime bundle.
+#
+# Primary attestation: engine.binary_sha256 = SHA-256 of inference-engine-runtime-*.tar.gz
+# Tag with canary/train semver (e.g. v0.9.0-rust-canary).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Pack runtime
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          export TEECHAT_ENGINE_BUILD_VERSION="$VERSION"
+          export TEECHAT_IE_PACK_OUT="$PWD/dist/release"
+          bash scripts/pack-runtime.sh
+          test -f dist/release/SHA256SUMS
+          test -f dist/release/RELEASE_MANIFEST.json
+          test -f "dist/release/inference-engine-runtime-${VERSION}.tar.gz"
+          cat dist/release/SHA256SUMS
+          cat dist/release/RELEASE_MANIFEST.json
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/release/inference-engine-runtime-*.tar.gz
+            dist/release/SHA256SUMS
+            dist/release/RELEASE_MANIFEST.json
+          generate_release_notes: true
+          body: |
+            ## Measured artifact
+
+            - **`inference-engine-runtime-*.tar.gz`** — primary (`engine.binary_sha256`)
+            - OPE FFI / attested-mtls digests are recorded independently in `RELEASE_MANIFEST.json`
+              (from `config/tcb-pins.json`); verify those TCBs on their own GitHub Releases.
+
+            Staging canary only — see `docs/CANARY.md`. Do not promote to prod without runbook sign-off.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
