@@ -39,6 +39,9 @@ Gate each milestone: `cargo test --workspace` + `cargo clippy --workspace --all-
 | `src/engine/epoch*.ts`, `rotating-decryptor.ts` | `ie-engine::epoch` | **Ported** |
 | `src/engine/pool-*.ts`, `gateway-migration*.ts` | `ie-engine::controls`, `cutover`, `gateway_migration` | **Ported** |
 | `src/upstream/vllm-chat.ts` | `crates/ie-upstream` | **Ported** — POST + SSE + `InferenceUpstream` impl |
+| `src/upstream/vllm-multimodal.ts` | `ie-upstream::multimodal` | **Ported** |
+| `src/engine/attestation-refresh.ts` | `ie-attestation::refresh` | **Ported** — wired on pool scale/migrate |
+| `src/runtime/engine-gateway-platform-verify.ts` | `ie-engine::plane::gateway_platform_verify` | **Ported** — SEC-029 platform policy |
 | `src/server/ope-inference.ts` | `ie-engine::infer` | **Ported** — decrypt → vLLM → encrypt + gate |
 | `src/metering.ts`, `src/prefill.ts`, `src/ephemeral.ts` | `ie-engine::ops` | **Ported** |
 | `src/engine/instance-id.ts` | `ie-engine::ops::instance_id` | **Ported** |
@@ -52,12 +55,22 @@ Gate each milestone: `cargo test --workspace` + `cargo clippy --workspace --all-
 2. **`ope.libope_ffi_sha256`** — independent OPE FFI TCB from `config/tcb-pins.json` / env overrides.
 3. **`attested_mtls.lib_attested_mtls_sha256`** — independent attested-mtls native library TCB.
 
-## Explicit non-goals until M6 green
+## Explicit non-goals (ops)
 
-- No replace of `engine-prod-1` / no blue-green cutover of TS IE
-- No TeeChat `minor-release` packaging of Rust IE
+- No replace of `engine-prod-1` / no blue-green cutover of TS IE until TeaChat ops runbook + preflight
+- No TeeChat `minor-release` packaging of Rust IE as the default prod engine
 - No fail-closed client changes that require Rust-only claims
 - Reserved canary id: `TEECHAT_OPE_ENGINE_ID=engine-rust-canary` — see [`CANARY.md`](CANARY.md)
+
+## Recent parity closes (post-M7)
+
+| Gap | Fix |
+|-----|-----|
+| Shared KV prefill across pull workers | `Arc<Mutex<HashMap>>` shared from `ie-bin` + cloned in pull |
+| Multimodal normalize | `ie-upstream::normalize_vllm_messages` / `estimate_prompt_tokens_from_messages` |
+| Attestation refresh on scale/migrate | `create_engine_attestation_refresher` + `SupervisedPool::set_attestation_refresh` |
+| SEC-029 full gateway platform verify | `PlatformPolicyGatewayAttestationVerifier` + `platform_policy_verifier_from_env` |
+| Gateway migration session map | Confirmed: `migrate_gateway_pool` dials `connect_to` with new `session_id`, updates slot |
 
 ## CLI parity
 
