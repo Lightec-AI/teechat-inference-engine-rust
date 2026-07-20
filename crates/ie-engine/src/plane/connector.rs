@@ -2,20 +2,26 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ie_protocol::{AttestedConnectRequest, AttestedDisconnectReason};
+use std::sync::Arc;
+
+use ie_protocol::{
+    AttestedConnectRequest, AttestedDisconnectReason, EngineEphemeralRegisterRequest,
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::plane::challenge::generate_gateway_connect_challenge_nonce;
+use crate::plane::ephemeral::post_ephemeral_on_attested_session;
 use crate::traits::{ConnectResult, EnginePlaneConnector};
 
 use super::connect::{open_pooled_connection, EnginePlaneDialOptions};
 use super::disconnect::graceful_disconnect_attested_session;
 use super::error::PlaneError;
-use super::session::AttestedH2Session;
+use super::session::{AttestedH2Session, PlaneTransport};
 
 /// Concrete HTTP/2 engine-plane connector owning live sessions.
 pub struct Http2EnginePlaneConnector {
-    dial: EnginePlaneDialOptions,
+    dial: Mutex<EnginePlaneDialOptions>,
     sessions: Mutex<HashMap<String, AttestedH2Session>>,
     disconnect_timeout: Duration,
     disconnect_poll: Duration,
@@ -24,7 +30,7 @@ pub struct Http2EnginePlaneConnector {
 impl Http2EnginePlaneConnector {
     pub fn new(dial: EnginePlaneDialOptions) -> Self {
         Self {
-            dial,
+            dial: Mutex::new(dial),
             sessions: Mutex::new(HashMap::new()),
             disconnect_timeout: Duration::from_secs(120),
             disconnect_poll: Duration::from_millis(250),
@@ -36,25 +42,60 @@ impl Http2EnginePlaneConnector {
         self.disconnect_poll = poll_interval;
         self
     }
-}
 
-#[async_trait]
-impl EnginePlaneConnector for Http2EnginePlaneConnector {
-    async fn connect(
+    /// Update the default dial URL (e.g. after full migration).
+    pub async fn set_gateway_base_url(&self, url: impl Into<String>) {
+        self.dial.lock().await.gateway_base_url = url.into();
+    }
+
+    pub async fn transport(&self, session_id: &str) -> Option<Arc<dyn PlaneTransport>> {
+        self.sessions
+            .lock()
+            .await
+            .get(session_id)
+            .map(|s| s.transport())
+    }
+
+    pub async fn post_ephemeral(
         &self,
+        session_id: &str,
+        body: &EngineEphemeralRegisterRequest,
+    ) -> Result<u16, String> {
+        let transport = self
+            .transport(session_id)
+            .await
+            .ok_or_else(|| format!("unknown session {session_id}"))?;
+        let session = AttestedH2Session::from_arc(session_id.to_string(), transport);
+        let resp = post_ephemeral_on_attested_session(&session, body)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(resp.status)
+    }
+
+    async fn connect_inner(
+        &self,
+        gateway_base_url: Option<&str>,
         request: AttestedConnectRequest,
     ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
-        let session_id = if request.session_id.trim().is_empty() {
-            Uuid::new_v4().to_string()
-        } else {
-            request.session_id.clone()
-        };
+        // Match TS `createEnginePlanePoolClient`: every pooled dial gets a fresh session id.
+        // Reusing the connect template's session_id collapses the HashMap entry and leaves
+        // orphan H2 connections — work-pull then never completes (dispatch timeout).
+        let session_id = Uuid::new_v4().to_string();
 
-        let mut dial = self.dial.clone();
+        let mut dial = self.dial.lock().await.clone();
+        if let Some(url) = gateway_base_url {
+            dial.gateway_base_url = url.trim().to_string();
+        }
         dial.connect_template = request;
+        dial.connect_template.session_id = session_id.clone();
         if dial.pool_target_size == 0 {
             dial.pool_target_size = dial.connect_template.pool_target_size.unwrap_or(1);
         }
+
+        // Fresh nonce per dial (template may be reused across pool connects).
+        let nonce = generate_gateway_connect_challenge_nonce();
+        dial.gateway_challenge_nonce = Some(nonce.clone());
+        dial.connect_template.gateway_challenge_nonce = Some(nonce);
 
         let (session, response) = open_pooled_connection(&dial, &session_id)
             .await
@@ -70,6 +111,24 @@ impl EnginePlaneConnector for Http2EnginePlaneConnector {
             response,
         })
     }
+}
+
+#[async_trait]
+impl EnginePlaneConnector for Http2EnginePlaneConnector {
+    async fn connect(
+        &self,
+        request: AttestedConnectRequest,
+    ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
+        self.connect_inner(None, request).await
+    }
+
+    async fn connect_to(
+        &self,
+        gateway_base_url: &str,
+        request: AttestedConnectRequest,
+    ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
+        self.connect_inner(Some(gateway_base_url), request).await
+    }
 
     async fn disconnect(
         &self,
@@ -83,11 +142,11 @@ impl EnginePlaneConnector for Http2EnginePlaneConnector {
             .ok_or_else(|| PlaneError::UnknownSession(session_id.to_string()))
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
-        let engine_id = self.dial.connect_template.engine_id.clone();
+        let engine_id = self.dial.lock().await.connect_template.engine_id.clone();
         let result = graceful_disconnect_attested_session(
             &session,
             &engine_id,
-            AttestedDisconnectReason::Shutdown,
+            AttestedDisconnectReason::Upgrade,
             self.disconnect_timeout,
             self.disconnect_poll,
         )

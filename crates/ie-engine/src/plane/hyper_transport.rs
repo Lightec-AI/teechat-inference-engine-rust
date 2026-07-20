@@ -4,25 +4,37 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use futures::stream;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use http_body::Frame;
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use ie_runtime::EngineClientTlsMaterial;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use serde_json::Value;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio_rustls::TlsConnector;
 use url::Url;
 
 use super::error::PlaneError;
-use super::session::{H2JsonResponse, PlaneTransport};
+use super::session::{H2BytesResponse, H2JsonResponse, PlaneTransport, StreamingPostHandle};
 
-type SendRequest = hyper::client::conn::http2::SendRequest<Full<Bytes>>;
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type ReqBody = BoxBody<Bytes, BoxError>;
+type SendRequest = hyper::client::conn::http2::SendRequest<ReqBody>;
+
+fn full_bytes(payload: Bytes) -> ReqBody {
+    Full::new(payload)
+        .map_err(|e: std::convert::Infallible| match e {})
+        .boxed()
+}
 
 pub struct HyperPlaneTransport {
     sender: Mutex<SendRequest>,
+    authority: String,
 }
 
 impl HyperPlaneTransport {
@@ -37,7 +49,10 @@ impl HyperPlaneTransport {
             Some(v) => Bytes::from(serde_json::to_vec(v)?),
             None => Bytes::new(),
         };
-        let mut builder = Request::builder().method(method).uri(path);
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(http::header::HOST, self.authority.as_str());
         if body.is_some() {
             builder = builder.header(http::header::CONTENT_TYPE, "application/json");
         }
@@ -45,20 +60,24 @@ impl HyperPlaneTransport {
             builder = builder.header(*k, *v);
         }
         let req = builder
-            .body(Full::new(payload))
+            .body(full_bytes(payload))
             .map_err(|e| PlaneError::H2(e.to_string()))?;
 
-        let mut sender = self.sender.lock().await;
-        let response = sender
-            .send_request(req)
-            .await
-            .map_err(|e| PlaneError::H2(e.to_string()))?;
+        // Release SendRequest before awaiting the body so long-poll work-pull and
+        // concurrent ephemeral POSTs can multiplex on the same H2 connection.
+        let response = {
+            let mut sender = self.sender.lock().await;
+            sender
+                .send_request(req)
+                .await
+                .map_err(|e| PlaneError::H2(format!("send_request: {e:?}")))?
+        };
         let status = response.status().as_u16();
         let collected = response
             .into_body()
             .collect()
             .await
-            .map_err(|e| PlaneError::H2(e.to_string()))?;
+            .map_err(|e| PlaneError::H2(format!("body: {e:?}")))?;
         let bytes = collected.to_bytes();
         let json = if bytes.is_empty() {
             Value::Null
@@ -68,6 +87,115 @@ impl HyperPlaneTransport {
             ))
         };
         Ok(H2JsonResponse { status, json })
+    }
+
+    async fn send_bytes(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        content_type: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> Result<H2BytesResponse, PlaneError> {
+        let payload = Bytes::from(body.unwrap_or_default().to_vec());
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(http::header::HOST, self.authority.as_str());
+        if let Some(ct) = content_type {
+            builder = builder.header(http::header::CONTENT_TYPE, ct);
+        } else if body.is_some() {
+            builder = builder.header(http::header::CONTENT_TYPE, "application/json");
+        }
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let req = builder
+            .body(full_bytes(payload))
+            .map_err(|e| PlaneError::H2(e.to_string()))?;
+
+        let response = {
+            let mut sender = self.sender.lock().await;
+            sender
+                .send_request(req)
+                .await
+                .map_err(|e| PlaneError::H2(format!("send_request: {e:?}")))?
+        };
+        let status = response.status().as_u16();
+        let mut headers_out = Vec::new();
+        for (name, value) in response.headers().iter() {
+            if let Ok(v) = value.to_str() {
+                headers_out.push((name.as_str().to_string(), v.to_string()));
+            }
+        }
+        let collected = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| PlaneError::H2(format!("body: {e:?}")))?;
+        Ok(H2BytesResponse {
+            status,
+            headers: headers_out,
+            body: collected.to_bytes(),
+        })
+    }
+
+    async fn open_streaming_post(
+        &self,
+        path: &str,
+        content_type: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<StreamingPostHandle, PlaneError> {
+        let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+        let body_stream = stream::unfold(rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|bytes| (Ok::<_, BoxError>(Frame::data(bytes)), rx))
+        });
+        let body = StreamBody::new(body_stream).boxed();
+
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(http::header::HOST, self.authority.as_str())
+            .header(http::header::CONTENT_TYPE, content_type);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let req = builder
+            .body(body)
+            .map_err(|e| PlaneError::H2(e.to_string()))?;
+
+        let response_fut = {
+            let mut sender = self.sender.lock().await;
+            // Do not await here: polling the future drives the streaming request body.
+            sender.send_request(req)
+        };
+
+        let join = tokio::spawn(async move {
+            let response = response_fut
+                .await
+                .map_err(|e| PlaneError::H2(format!("response: {e:?}")))?;
+            let status = response.status().as_u16();
+            let mut headers_out = Vec::new();
+            for (name, value) in response.headers().iter() {
+                if let Ok(v) = value.to_str() {
+                    headers_out.push((name.as_str().to_string(), v.to_string()));
+                }
+            }
+            let collected = response
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| PlaneError::H2(format!("body: {e:?}")))?;
+            Ok(H2BytesResponse {
+                status,
+                headers: headers_out,
+                body: collected.to_bytes(),
+            })
+        });
+
+        Ok(StreamingPostHandle::new(tx, join))
     }
 }
 
@@ -83,7 +211,28 @@ impl PlaneTransport for HyperPlaneTransport {
         self.send(method, path, body, headers).await
     }
 
-    async fn close(self: Box<Self>) -> Result<(), PlaneError> {
+    async fn request_bytes(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        content_type: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> Result<H2BytesResponse, PlaneError> {
+        self.send_bytes(method, path, body, content_type, headers)
+            .await
+    }
+
+    async fn open_streaming_bytes_post(
+        &self,
+        path: &str,
+        content_type: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<StreamingPostHandle, PlaneError> {
+        self.open_streaming_post(path, content_type, headers).await
+    }
+
+    async fn close(&self) -> Result<(), PlaneError> {
         Ok(())
     }
 }
@@ -111,13 +260,23 @@ pub async fn dial_hyper_transport(
     let tls_stream = connector
         .connect(server_name, tcp)
         .await
-        .map_err(|e| PlaneError::Tls(e.to_string()))?;
+        .map_err(|e| PlaneError::Tls(format!("{e:?}")))?;
+    let alpn = tls_stream
+        .get_ref()
+        .1
+        .alpn_protocol()
+        .map(|p| String::from_utf8_lossy(p).into_owned());
+    if alpn.as_deref() != Some("h2") {
+        return Err(PlaneError::Tls(format!(
+            "expected ALPN h2, negotiated={alpn:?}"
+        )));
+    }
 
     let io = TokioIo::new(tls_stream);
     let (sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
         .handshake(io)
         .await
-        .map_err(|e| PlaneError::H2(e.to_string()))?;
+        .map_err(|e| PlaneError::H2(format!("{e:?}")))?;
 
     tokio::spawn(async move {
         if let Err(err) = conn.await {
@@ -125,8 +284,14 @@ pub async fn dial_hyper_transport(
         }
     });
 
+    let authority = if port == 443 {
+        host
+    } else {
+        format!("{host}:{port}")
+    };
     Ok(Box::new(HyperPlaneTransport {
         sender: Mutex::new(sender),
+        authority,
     }))
 }
 
@@ -155,55 +320,16 @@ fn build_client_config(
 
     let builder = ClientConfig::builder().with_root_certificates(root_store);
     let mut config = builder
-        .with_client_auth_cert(certs, PrivateKeyDer::from(key))
+        .with_client_auth_cert(certs, key)
         .map_err(|e| PlaneError::Tls(format!("client auth: {e}")))?;
     config.alpn_protocols = vec![b"h2".to_vec()];
 
     if !reject_unauthorized {
-        config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(NoVerifier));
+        return Err(PlaneError::Tls(
+            "reject_unauthorized=false is disabled; set TEECHAT_ENGINE_ALLOW_INSECURE_TLS=1 only for local labs".into(),
+        ));
     }
 
+    let _ = reject_unauthorized;
     Ok(config)
-}
-
-#[derive(Debug)]
-struct NoVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for NoVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
 }

@@ -10,26 +10,38 @@ rust-version.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 bytes = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+futures = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }
+http-body = "1"
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 ie-attestation = { workspace = true }
+ie-crypto = { workspace = true }
 ie-protocol = { workspace = true }
 ie-runtime = { workspace = true }
+ie-upstream = { workspace = true }
+ope-crypto = { workspace = true }
 rand = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal", "fs"] }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+ope-e2e = { workspace = true }
+ope-envelope = { workspace = true }
 rcgen = "0.13"
-tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+wiremock = "0.6"

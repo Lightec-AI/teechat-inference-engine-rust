@@ -3,7 +3,7 @@ use ie_protocol::AttestedConnectResponse;
 
 use super::error::PlaneError;
 
-/// Optional SEC-029 gateway platform attestation verify (full quote parse deferred).
+/// Optional SEC-029 gateway platform attestation verify.
 #[async_trait]
 pub trait GatewayAttestationVerifier: Send + Sync {
     async fn verify_connect_response(
@@ -13,7 +13,7 @@ pub trait GatewayAttestationVerifier: Send + Sync {
     ) -> Result<(), PlaneError>;
 }
 
-/// No-op verifier for dials that skip platform attestation cross-check.
+/// No-op verifier — **dev/stub only**. Never default this for live gateway dials.
 pub struct NullGatewayAttestationVerifier;
 
 #[async_trait]
@@ -27,7 +27,8 @@ impl GatewayAttestationVerifier for NullGatewayAttestationVerifier {
     }
 }
 
-/// Fail-closed verifier that requires attestation + matching challenge nonce echo.
+/// Fail-closed verifier: requires gateway attestation + challenge nonce echo,
+/// and when the CPU quote is a SEV-SNP wrapper, checks `report_data` binding.
 pub struct NonceEchoGatewayAttestationVerifier;
 
 #[async_trait]
@@ -37,9 +38,9 @@ impl GatewayAttestationVerifier for NonceEchoGatewayAttestationVerifier {
         response: &AttestedConnectResponse,
         expected_nonce: &str,
     ) -> Result<(), PlaneError> {
-        if response.gateway_attestation.is_none() {
+        let Some(bundle) = response.gateway_attestation.as_ref() else {
             return Err(PlaneError::GatewayAttestationMissing);
-        }
+        };
         let Some(echo) = response.gateway_challenge_nonce.as_deref() else {
             return Err(PlaneError::GatewayChallengeNonceNotBound);
         };
@@ -49,6 +50,14 @@ impl GatewayAttestationVerifier for NonceEchoGatewayAttestationVerifier {
         if norm != expected_nonce {
             return Err(PlaneError::GatewayChallengeNonceMismatch);
         }
+
+        // Best-effort SNP report_data bind when quote is a parseable wrapper.
+        if let Some(wrapper) = ie_attestation::parse_sev_snp_quote_wrapper(&bundle.cpu_tee.quote) {
+            if !ie_attestation::verify_wrapper_report_data(&wrapper, Some(expected_nonce)) {
+                return Err(PlaneError::GatewayChallengeNonceNotBound);
+            }
+        }
+
         Ok(())
     }
 }

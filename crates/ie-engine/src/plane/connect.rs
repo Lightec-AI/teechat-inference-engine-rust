@@ -193,7 +193,7 @@ mod tests {
                     json: self.body.clone(),
                 })
             }
-            async fn close(self: Box<Self>) -> Result<(), PlaneError> {
+            async fn close(&self) -> Result<(), PlaneError> {
                 Ok(())
             }
         }
@@ -250,7 +250,7 @@ mod tests {
                     json: json!({ "error": "busy" }),
                 })
             }
-            async fn close(self: Box<Self>) -> Result<(), PlaneError> {
+            async fn close(&self) -> Result<(), PlaneError> {
                 Ok(())
             }
         }

@@ -102,7 +102,7 @@ mod tests {
                 }),
             })
         }
-        async fn close(self: Box<Self>) -> Result<(), PlaneError> {
+        async fn close(&self) -> Result<(), PlaneError> {
             Ok(())
         }
     }
@@ -148,7 +148,7 @@ mod tests {
                     }),
                 })
             }
-            async fn close(self: Box<Self>) -> Result<(), PlaneError> {
+            async fn close(&self) -> Result<(), PlaneError> {
                 Ok(())
             }
         }

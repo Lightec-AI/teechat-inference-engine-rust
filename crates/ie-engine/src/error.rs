@@ -10,4 +10,8 @@ pub enum EngineError {
     CircuitOpen { until_ms: u64 },
     #[error("inference upstream error: {0}")]
     Infer(String),
+    #[error("epoch error: {0}")]
+    Epoch(String),
+    #[error("pool scale error: {0}")]
+    Scale(String),
 }

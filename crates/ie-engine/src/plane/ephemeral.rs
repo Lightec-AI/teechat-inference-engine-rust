@@ -52,7 +52,7 @@ mod tests {
                     json: json!({ "ok": true }),
                 })
             }
-            async fn close(self: Box<Self>) -> Result<(), PlaneError> {
+            async fn close(&self) -> Result<(), PlaneError> {
                 Ok(())
             }
         }

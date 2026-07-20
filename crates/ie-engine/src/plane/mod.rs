@@ -7,6 +7,7 @@ mod disconnect;
 mod ephemeral;
 mod error;
 mod hyper_transport;
+mod pull;
 mod session;
 mod verify;
 
@@ -24,7 +25,10 @@ pub use disconnect::{
 };
 pub use ephemeral::post_ephemeral_on_attested_session;
 pub use error::PlaneError;
-pub use session::{AttestedH2Session, H2JsonResponse, PlaneTransport};
+pub use pull::{start_pull_worker, PullWorkerHandle};
+pub use session::{
+    AttestedH2Session, H2BytesResponse, H2JsonResponse, PlaneTransport, StreamingPostHandle,
+};
 pub use verify::{
     GatewayAttestationVerifier, NonceEchoGatewayAttestationVerifier, NullGatewayAttestationVerifier,
 };
