@@ -7,3 +7,5 @@ Cargo.lock
 native/
 *.so
 .DS_Store
+.cargo-linux/
+dist/

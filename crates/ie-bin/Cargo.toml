@@ -12,12 +12,22 @@ name = "teechat-inference-engine"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { workspace = true }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 ie-attestation = { workspace = true }
+ie-crypto = { workspace = true }
 ie-engine = { workspace = true }
 ie-protocol = { workspace = true }
 ie-runtime = { workspace = true }
+ie-upstream = { workspace = true }
+ope-crypto = { workspace = true }
+rand = { workspace = true }
+rustls = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { workspace = true }
