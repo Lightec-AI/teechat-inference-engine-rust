@@ -22,8 +22,8 @@ Gate each milestone: `cargo test --workspace` + `cargo clippy --workspace --all-
 
 | TypeScript | Rust | Status |
 |------------|------|--------|
-| `src/protocol/types.ts` | `crates/ie-protocol` | **Ported** |
-| `src/protocol/ope-stream.ts` | `ie-protocol::ope_stream` | **Ported** |
+| `src/protocol/types.ts` | ~~`crates/ie-protocol`~~ → OPE `ope-protocol` (re-export) | **SoT in OPE** |
+| `src/protocol/ope-stream.ts` | OPE `ope-protocol::ope_stream` | **SoT in OPE** |
 | `src/sev-snp/measurements.ts` | `crates/ie-attestation/src/measurements.rs` | **Ported** |
 | `src/sev-snp/build-attestation.ts` | `ie-attestation` bundle/claims | **Ported** |
 | `src/sev-snp/guest-report.ts`, `quote.ts`, `verify-report.ts` | `ie-attestation::sev_snp` | **Ported** — hardware paths `#[ignore]` without device |
