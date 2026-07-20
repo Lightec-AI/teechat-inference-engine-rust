@@ -21,14 +21,18 @@ to this repo; `engine-trust-client` already follows it.
 |------|--------|-------|
 | 1 | Bump workspace version in `Cargo.toml`; local smoke (`cargo test` / `clippy` / `pack-runtime.sh`) | Laptop digest is **not** the measured pin |
 | 2 | Commit, tag `vX.Y.Z`, push | Actions (`.github/workflows/release.yml`) builds **linux-amd64** |
-| 3 | Wait for Release assets | `inference-engine-runtime-*.tar.gz`, `SHA256SUMS`, `RELEASE_MANIFEST.json` |
-| 4 | Add TeaChat `engine.active[]` row | `binarySha256` = **CI** digest; `releaseUrl` = this repo’s `/releases`; copy vLLM/OPE fields forward |
-| 5 | Validate + sync platform manifest | `pnpm ops:validate-platform-manifest` then sync (`--no-restart` if version-only) |
+| 3 | **Watch** Release workflow; wait for assets | `gh run watch -R Lightec-AI/teechat-inference-engine-rust` |
+| 4 | **In TeaChat**, unshift `engine.active[]` + append `allowedEngineBinarySha256` from CI digests | `curl …/SHA256SUMS` + `RELEASE_MANIFEST.json`; copy vLLM/OPE from live row; bump `publishedAt`; validate |
+| 5 | Sync platform manifest when ops env allows | `pnpm ops:sync-prod-platform-manifest -- --no-restart` if version-only |
 | 6 | Install **GitHub** tarball on staging guest | Pin `TEECHAT_IE_RUNTIME_SHA256` to the CI digest; start as `engine-rust-canary` |
+
+Step 4 is part of the cut, not a separate handoff: after a successful Release, write the
+pins in the same session (see TeaChat `docs/ops/client-attestation-github-trust.md`).
 
 ```bash
 curl -fsSL "https://github.com/Lightec-AI/teechat-inference-engine-rust/releases/download/v${VER}/SHA256SUMS"
 # must equal platform-binaries.json engine row binarySha256
+# and attestation-policy.prod.json allowedEngineBinarySha256
 ```
 
 ## Local smoke (before tag; no prod/manifest pin)
