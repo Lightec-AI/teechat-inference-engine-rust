@@ -8,10 +8,16 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+hmac = "0.12"
 ie-protocol = { workspace = true }
+ope-crypto = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+subtle = "2"
+tempfile = "3"
 thiserror = { workspace = true }
 hex = { workspace = true }
 

@@ -289,7 +289,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn engine_sha_distinct_from_ope_ffi() {
+    fn engine_sha_distinct_from_ope_ffi_and_attested_mtls() {
         let dir = TempDir::new().unwrap();
         fs::create_dir_all(dir.path().join("config")).unwrap();
         fs::write(
@@ -310,7 +310,10 @@ mod tests {
 
         let m = resolve_binary_measurements_from_env(&env, dir.path()).unwrap();
         assert_eq!(m.engine_binary_sha256, "aa".repeat(32));
-        assert_ne!(m.engine_binary_sha256, m.ope.as_ref().unwrap().libope_ffi_sha256);
-        assert!(m.attested_mtls.is_some());
+        let ope = m.ope.as_ref().unwrap();
+        let amt = m.attested_mtls.as_ref().unwrap();
+        assert_ne!(m.engine_binary_sha256, ope.libope_ffi_sha256);
+        assert_ne!(m.engine_binary_sha256, amt.lib_attested_mtls_sha256);
+        assert_ne!(ope.libope_ffi_sha256, amt.lib_attested_mtls_sha256);
     }
 }

@@ -20,4 +20,20 @@ pub enum AttestationError {
     },
     #[error("invalid tcb pins: {reason}")]
     InvalidTcbPins { reason: String },
+    #[error("/dev/sev-guest is not available")]
+    SevGuestUnavailable,
+    #[error("failed to invoke {bin}: {source}")]
+    ToolInvoke {
+        bin: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("tool {bin} failed")]
+    ToolFailed { bin: String },
+    #[error("invalid TEECHAT_SNP_GUEST_BIN (allow snpguest or /usr/bin|/usr/local/bin/snpguest): {0}")]
+    InvalidSnpGuestBin(String),
+    #[error("invalid TEECHAT_NVATTEST_BIN (allow nvattest or /usr/bin|/usr/local/bin/nvattest): {0}")]
+    InvalidNvattestBin(String),
+    #[error("gpu_cc_mode_off")]
+    GpuCcModeOff,
 }
