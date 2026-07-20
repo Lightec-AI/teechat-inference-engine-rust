@@ -2,8 +2,10 @@
 //!
 //! Port of `@teechat/inference-engine` `src/protocol/types.ts`.
 
+mod ope_stream;
 mod traffic;
 
+pub use ope_stream::*;
 pub use traffic::*;
 
 use serde::{Deserialize, Serialize};
@@ -143,9 +145,18 @@ pub struct OpeE2eDescriptor {
     pub client_share: Option<String>,
     pub engine_mlkem_encap: String,
     pub engine_x25519: String,
+    /// Present on gateway-routed envelopes; optional for raw ope-e2e wire fields.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ephemeral_epoch: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_alg: Option<String>,
+    /// Request-path ML-KEM ciphertext (ope-e2e `E2eFields`); not always present on protocol stubs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mlkem_ciphertext: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_x25519: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_share: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,6 +260,7 @@ pub const ENGINE_PLANE_PATH_DISCONNECT: &str = "/v1/ope/control/disconnect";
 pub const ENGINE_PLANE_PATH_EPHEMERAL: &str = "/v1/ope/control/ephemeral";
 pub const ENGINE_PLANE_PATH_POOL: &str = "/v1/ope/control/pool";
 pub const ENGINE_PLANE_PATH_WORK_PULL: &str = "/v1/ope/work/pull";
+pub const ENGINE_PLANE_PATH_INFERENCE_RESULT: &str = "/v1/ope/inference/result";
 
 pub const MOCK_MLKEM_ENCAP_B64URL_LEN: usize = 1184;
 

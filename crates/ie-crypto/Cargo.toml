@@ -14,6 +14,8 @@ ope = ["dep:ope-crypto", "dep:ope-envelope", "dep:ope-transport", "dep:ope-e2e"]
 [dependencies]
 ie-protocol = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
 ope-crypto = { workspace = true, optional = true }
 ope-envelope = { workspace = true, optional = true }
 ope-transport = { workspace = true, optional = true }
