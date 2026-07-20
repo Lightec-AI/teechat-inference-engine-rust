@@ -23,17 +23,26 @@ to this repo; `engine-trust-client` already follows it.
 | 2 | Commit, tag `vX.Y.Z`, push | Actions (`.github/workflows/release.yml`) builds **linux-amd64** |
 | 3 | **Watch** Release workflow; wait for assets | `gh run watch -R Lightec-AI/teechat-inference-engine-rust` |
 | 4 | **In TeaChat**, unshift `engine.active[]` + append `allowedEngineBinarySha256` from CI digests | `curl …/SHA256SUMS` + `RELEASE_MANIFEST.json`; copy vLLM/OPE from live row; bump `publishedAt`; validate |
-| 5 | Sync platform manifest when ops env allows | `pnpm ops:sync-prod-platform-manifest -- --no-restart` if version-only |
-| 6 | Install **GitHub** tarball on staging guest | Pin `TEECHAT_IE_RUNTIME_SHA256` to the CI digest; start as `engine-rust-canary` |
+| 5 | Sync platform manifest + **reload** active gateway policy | `bash scripts/ops/sync-prod-platform-manifest.sh` then policy reload (`flip-gateway-slot.sh --manifest-only --skip-engine-settle` or restart active unit). Disk copy alone does not load new `allowedEngineBinarySha256`. |
+| 6 | Install **GitHub** tarball under `/opt/teechat-engine-rust-canary` on `prod-engine` | Sidecar unit `teechat-engine-rust-canary`; pin env hashes; set `TEECHAT_ENGINE_GATEWAY_URL` to the **active** engine plane (same host/port as `.env.prod.engine-{active}`) |
 
-Step 4 is part of the cut, not a separate handoff: after a successful Release, write the
-pins in the same session (see TeaChat `docs/ops/client-attestation-github-trust.md`).
+Step 4–6 are part of the cut, not a separate handoff: after a successful Release, write the
+pins and install in the same session (see TeaChat `docs/ops/client-attestation-github-trust.md`).
 
 ```bash
 curl -fsSL "https://github.com/Lightec-AI/teechat-inference-engine-rust/releases/download/v${VER}/SHA256SUMS"
 # must equal platform-binaries.json engine row binarySha256
 # and attestation-policy.prod.json allowedEngineBinarySha256
 ```
+
+### Guest paths (prod-engine sidecar)
+
+| Path | Role |
+|------|------|
+| `/opt/teechat-engine-rust-canary/current` | Symlink to `releases/inference-engine-runtime-X.Y.Z` |
+| `/etc/teechat/.env.prod.engine-rust-canary` | `TEECHAT_OPE_ENGINE_ID=engine-rust-canary` + measured digests |
+| `teechat-engine-rust-canary.service` | systemd unit (`WorkingDirectory` = `current`) |
+| `/etc/teechat/engine-pool-status-rust-canary.json` | Pool status (`teechat-engine-pool-status/v1`) |
 
 ## Local smoke (before tag; no prod/manifest pin)
 
