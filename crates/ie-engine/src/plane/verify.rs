@@ -1,4 +1,8 @@
 use async_trait::async_trait;
+use ie_attestation::{
+    verify_platform_attestation_bundle_mock, AttestationPolicy, PlatformAttestationBind,
+    PlatformAttestationPolicy,
+};
 use ie_protocol::AttestedConnectResponse;
 
 use super::error::PlaneError;
@@ -58,6 +62,52 @@ impl GatewayAttestationVerifier for NonceEchoGatewayAttestationVerifier {
             }
         }
 
+        Ok(())
+    }
+}
+
+/// Full SEC-029 verifier: nonce echo + platform policy + bundle hash/ed25519 bind
+/// (parity with TS `verifyPlatformAttestationBundle`).
+pub struct PlatformPolicyGatewayAttestationVerifier {
+    pub engine_policy: AttestationPolicy,
+    pub platform_policy: PlatformAttestationPolicy,
+    pub bind: PlatformAttestationBind,
+}
+
+#[async_trait]
+impl GatewayAttestationVerifier for PlatformPolicyGatewayAttestationVerifier {
+    async fn verify_connect_response(
+        &self,
+        response: &AttestedConnectResponse,
+        expected_nonce: &str,
+    ) -> Result<(), PlaneError> {
+        // Nonce + SNP report_data first (same as NonceEcho).
+        NonceEchoGatewayAttestationVerifier
+            .verify_connect_response(response, expected_nonce)
+            .await?;
+
+        let bundle = response
+            .gateway_attestation
+            .as_ref()
+            .expect("nonce echo verified attestation present");
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let verdict = verify_platform_attestation_bundle_mock(
+            bundle,
+            &self.engine_policy,
+            &self.platform_policy,
+            &self.bind,
+            now_ms,
+        );
+        if !verdict.ok {
+            return Err(PlaneError::GatewayPlatformAttestationFailed {
+                reason: verdict.reason.unwrap_or_else(|| "unknown".into()),
+            });
+        }
         Ok(())
     }
 }

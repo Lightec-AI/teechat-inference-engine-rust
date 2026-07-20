@@ -7,7 +7,9 @@ mod fixture;
 mod measurements;
 mod mock_quote;
 mod nv_cc;
+mod platform;
 mod policy;
+mod refresh;
 mod sev_snp;
 mod tcb_pins;
 mod verify;
@@ -31,9 +33,16 @@ pub use nv_cc::{
     validate_nv_gpu_claims_against_policy, verify_mock_nv_cc_gpu_evidence, verify_nv_cc_gpu_evidence,
     GpuAttestationPolicy, GpuEvidenceVerifyResult,
 };
+pub use platform::{
+    verify_platform_attestation_bundle, verify_platform_attestation_bundle_mock,
+    PlatformAttestationBind, PlatformAttestationPolicy,
+};
 pub use policy::{
     default_test_attestation_policy, verify_bundle_with_verifier, verify_claims_against_policy,
     AttestationPolicy, AttestationVerifyResult,
+};
+pub use refresh::{
+    create_engine_attestation_refresher, EngineAttestationRefreshContext, EngineAttestationRefresher,
 };
 pub use sev_snp::{
     bind_report_data_64, build_engine_attestation_bundle, encode_sev_snp_quote_wrapper,

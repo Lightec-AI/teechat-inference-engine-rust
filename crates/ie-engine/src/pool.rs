@@ -6,13 +6,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use ie_protocol::AttestedConnectRequest;
+use ie_protocol::{AttestationBundle, AttestedConnectRequest};
 
 use crate::config::SupervisedPoolConfig;
 use crate::cutover::{plan_pool_drain, plan_pool_scale};
 use crate::error::EngineError;
 use crate::gateway_migration::plan_gateway_migration;
 use crate::traits::{ConnectResult, EnginePlaneConnector, InferenceUpstream, InferResult};
+
+/// Remint attestation before reconnect / scale / migrate (optional).
+pub type AttestationRefreshFn =
+    Arc<dyn Fn() -> Result<AttestationBundle, String> + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub struct PoolSession {
@@ -79,6 +83,8 @@ pub struct SupervisedPool {
     upstream: Arc<dyn InferenceUpstream>,
     /// Last successful connect template (used by scale / migrate).
     connect_template: RwLock<Option<AttestedConnectRequest>>,
+    /// Optional remint hook (parity with TS `applyFreshAttestation`).
+    attestation_refresh: RwLock<Option<AttestationRefreshFn>>,
     state: RwLock<PoolState>,
 }
 
@@ -99,8 +105,28 @@ impl SupervisedPool {
             connector,
             upstream,
             connect_template: RwLock::new(None),
+            attestation_refresh: RwLock::new(None),
             state: RwLock::new(PoolState::default()),
         }
+    }
+
+    /// Install / replace attestation remint used on scale + migrate (+ reconnect paths).
+    pub async fn set_attestation_refresh(&self, refresh: Option<AttestationRefreshFn>) {
+        *self.attestation_refresh.write().await = refresh;
+    }
+
+    async fn apply_fresh_attestation(
+        &self,
+        mut request: AttestedConnectRequest,
+    ) -> Result<AttestedConnectRequest, EngineError> {
+        let refresh = self.attestation_refresh.read().await.clone();
+        if let Some(refresh) = refresh {
+            let fresh = refresh().map_err(|e| {
+                EngineError::Connect(format!("attestation_refresh failed: {e}"))
+            })?;
+            request.attestation = fresh;
+        }
+        Ok(request)
     }
 
     pub async fn gateway_base_url(&self) -> String {
@@ -150,6 +176,7 @@ impl SupervisedPool {
             return Err(EngineError::CircuitOpen { until_ms: until });
         }
 
+        let request = self.apply_fresh_attestation(request).await?;
         *self.connect_template.write().await = Some(request.clone());
         let gateway = self.gateway_base_url.read().await.clone();
         match self.connector.connect(request).await {
@@ -388,6 +415,8 @@ impl SupervisedPool {
             req.session_id = uuid::Uuid::new_v4().to_string();
             req.gateway_challenge_nonce =
                 Some(crate::plane::generate_gateway_connect_challenge_nonce());
+            let req = self.apply_fresh_attestation(req).await?;
+            *self.connect_template.write().await = Some(req.clone());
 
             let new_conn = match self.connector.connect_to(&normalized, req).await {
                 Ok(r) => r,

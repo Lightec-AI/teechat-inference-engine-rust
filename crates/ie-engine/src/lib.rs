@@ -54,15 +54,15 @@ pub use plane::{
     build_connect_request, generate_gateway_connect_challenge_nonce,
     graceful_disconnect_attested_session, is_valid_gateway_connect_challenge_nonce,
     normalize_gateway_connect_challenge_nonce, open_pooled_connection,
-    open_pooled_connection_on_transport, post_disconnect_on_attested_session,
-    post_ephemeral_on_attested_session, start_pull_worker, AttestedH2Session,
-    EnginePlaneDialOptions, GatewayAttestationVerifier, H2BytesResponse, H2JsonResponse,
-    Http2EnginePlaneConnector, NonceEchoGatewayAttestationVerifier,
-    NullGatewayAttestationVerifier, PlaneError, PlaneTransport, PullWorkerHandle,
-    StreamingPostHandle,
+    open_pooled_connection_on_transport, platform_policy_verifier_from_env,
+    post_disconnect_on_attested_session, post_ephemeral_on_attested_session, start_pull_worker,
+    AttestedH2Session, EnginePlaneDialOptions, GatewayAttestationVerifier, H2BytesResponse,
+    H2JsonResponse, Http2EnginePlaneConnector, NonceEchoGatewayAttestationVerifier,
+    NullGatewayAttestationVerifier, PlaneError, PlaneTransport, PlatformPolicyGatewayAttestationVerifier,
+    PullWorkerHandle, StreamingPostHandle,
 };
 pub use pool::{
-    sessions_by_gateway_url_from_slots, GatewayMigrationResult, PoolDrainResult, PoolScaleResult,
-    PoolSession, SupervisedPool, SupervisedPoolHandle,
+    sessions_by_gateway_url_from_slots, AttestationRefreshFn, GatewayMigrationResult,
+    PoolDrainResult, PoolScaleResult, PoolSession, SupervisedPool, SupervisedPoolHandle,
 };
 pub use traits::{ConnectResult, EnginePlaneConnector, InferResult, InferenceUpstream};
