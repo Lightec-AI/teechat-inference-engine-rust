@@ -8,7 +8,30 @@ The Rust InferenceEngine canary uses a reserved engine id so it never collides w
 export TEECHAT_OPE_ENGINE_ID=engine-rust-canary
 ```
 
-## Staging smoke (no prod install)
+## Measured release order (GitHub + platform manifest)
+
+Clients verify `engine.binary_sha256` against **both** this repo’s GitHub Release
+`SHA256SUMS` and TeeChat `platform-binaries.json` (row `releaseUrl` must point here).
+See TeaChat [client-attestation-github-trust.md](https://github.com/Lightec-AI/TeaChat/blob/main/docs/ops/client-attestation-github-trust.md).
+
+**No client code change** is required for Rust IE — set the manifest row’s `releaseUrl`
+to this repo; `engine-trust-client` already follows it.
+
+| Step | Action | Notes |
+|------|--------|-------|
+| 1 | Bump workspace version in `Cargo.toml`; local smoke (`cargo test` / `clippy` / `pack-runtime.sh`) | Laptop digest is **not** the measured pin |
+| 2 | Commit, tag `vX.Y.Z`, push | Actions (`.github/workflows/release.yml`) builds **linux-amd64** |
+| 3 | Wait for Release assets | `inference-engine-runtime-*.tar.gz`, `SHA256SUMS`, `RELEASE_MANIFEST.json` |
+| 4 | Add TeaChat `engine.active[]` row | `binarySha256` = **CI** digest; `releaseUrl` = this repo’s `/releases`; copy vLLM/OPE fields forward |
+| 5 | Validate + sync platform manifest | `pnpm ops:validate-platform-manifest` then sync (`--no-restart` if version-only) |
+| 6 | Install **GitHub** tarball on staging guest | Pin `TEECHAT_IE_RUNTIME_SHA256` to the CI digest; start as `engine-rust-canary` |
+
+```bash
+curl -fsSL "https://github.com/Lightec-AI/teechat-inference-engine-rust/releases/download/v${VER}/SHA256SUMS"
+# must equal platform-binaries.json engine row binarySha256
+```
+
+## Local smoke (before tag; no prod/manifest pin)
 
 1. Build and pack the runtime:
 
@@ -18,7 +41,9 @@ export TEECHAT_OPE_ENGINE_ID=engine-rust-canary
    bash scripts/pack-runtime.sh
    ```
 
-2. On a **staging** engine guest only, install the tarball from `dist/release/` (not prod blue/green slots).
+2. On a **staging** engine guest only, you may install a local tarball from `dist/release/`
+   for bring-up debugging — but **client trust** will fail until the guest runs the
+   **same** bytes published on the GitHub Release and listed in the manifest.
 
 3. Load staging env (`.env.staging` or equivalent):
 
@@ -41,16 +66,17 @@ export TEECHAT_OPE_ENGINE_ID=engine-rust-canary
 |------|--------|---------------|
 | 1 | Register | Engine attested connect succeeds; pool boots to configured target (or staging half-pool fraction) |
 | 2 | Ephemeral | Initial epoch registers on all live sessions (`201` on engine-plane ephemeral path) |
-| 3 | Pull | Work-pull worker accepts at least one idle session (M2 parity when landed) |
+| 3 | Pull | Work-pull worker accepts at least one idle session |
 | 4 | Confidential round-trip | One OPE inference request decrypts, upstream completes, encrypted response returns |
 | 5 | Drain control | Write `/etc/teechat/engine-pool-drain-<slot>.json` + `SIGUSR2`; idle sessions drain without restart |
 | 6 | Scale control | Write `/etc/teechat/engine-pool-scale-<slot>.json`; pool grows in-process |
 | 7 | Status | `/etc/teechat/engine-pool-status-<slot>.json` publishes `teechat-engine-pool-status/v1` with `live_sessions` |
+| 8 | Client trust | Prod-policy client: GitHub `source: "github"` for engine hash (or CN `manifest_fallback`); no `engine_hash_not_on_release` |
 
 ## Explicit non-goals until green
 
 - No replace of `engine-prod-1` or production blue/green cutover
-- No TeeChat `minor-release` packaging of Rust IE
+- No TeeChat `minor-release` packaging of Rust IE as the default prod engine
 - No fail-closed client changes requiring Rust-only attestation claims
 
-When all rows pass on staging, document the manifest SHA256 in the release notes — still **do not** promote to prod without an explicit ops runbook sign-off.
+When all rows pass on staging, document the CI `ieRuntimeSha256` in the release notes — still **do not** promote to prod without an explicit ops runbook sign-off.
