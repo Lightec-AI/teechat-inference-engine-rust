@@ -1,7 +1,10 @@
 //! Gateway-origin background inference (port of `server/gateway-plane-task-inference.ts`).
 
 use ie_protocol::{GatewayPlaneTaskPayload, OpeEnvelope};
-use ie_upstream::{clamp_vllm_max_tokens, VllmChatClient, VllmCompleteOptions};
+use ie_upstream::{
+    clamp_vllm_max_tokens, estimate_prompt_tokens_from_messages, normalize_vllm_messages,
+    VllmChatClient, VllmCompleteOptions,
+};
 use serde_json::{json, Value};
 
 use super::ope_inference::OpeInferenceResult;
@@ -63,7 +66,8 @@ fn tokens_from_text(text: &str) -> u64 {
 }
 
 fn messages_to_json(task: &GatewayPlaneTaskPayload) -> Vec<Value> {
-    task.messages
+    let raw: Vec<Value> = task
+        .messages
         .iter()
         .map(|m| {
             json!({
@@ -71,7 +75,8 @@ fn messages_to_json(task: &GatewayPlaneTaskPayload) -> Vec<Value> {
                 "content": m.content,
             })
         })
-        .collect()
+        .collect();
+    normalize_vllm_messages(&raw)
 }
 
 /// Run gateway-plane-task (plaintext meta) via vLLM; return OpenAI-shaped JSON.
@@ -113,14 +118,7 @@ pub async fn run_gateway_plane_task_inference(
         .and_then(|m| m.gateway_task.as_ref())
         .expect("validated");
     let messages = messages_to_json(task);
-    let prompt_tokens = tokens_from_text(
-        &task
-            .messages
-            .iter()
-            .map(|m| m.content.as_str())
-            .collect::<Vec<_>>()
-            .join(" "),
-    );
+    let prompt_tokens = estimate_prompt_tokens_from_messages(&messages);
 
     let max_tokens = task.max_tokens.map(clamp_vllm_max_tokens);
     let content = match vllm

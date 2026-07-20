@@ -2,6 +2,7 @@
 
 mod client;
 mod error;
+mod multimodal;
 mod sse;
 
 pub use client::{
@@ -10,4 +11,5 @@ pub use client::{
     VllmStreamOptions, VLLM_MAX_TOKENS_DEFAULT, VLLM_MAX_TOKENS_MAX, VLLM_MAX_TOKENS_MIN,
 };
 pub use error::UpstreamError;
+pub use multimodal::{estimate_prompt_tokens_from_messages, normalize_vllm_messages};
 pub use sse::{parse_sse_data_line, stream_text_from_vllm_choice};

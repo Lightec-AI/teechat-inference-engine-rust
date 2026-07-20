@@ -9,9 +9,10 @@ use ie_protocol::{
     CONTENT_TYPE_OPE_JSON_STREAM,
 };
 use ie_upstream::{
-    clamp_vllm_max_tokens, VllmChatClient, VllmStreamOptions, VLLM_MAX_TOKENS_DEFAULT,
+    clamp_vllm_max_tokens, estimate_prompt_tokens_from_messages, normalize_vllm_messages,
+    VllmChatClient, VllmStreamOptions, VLLM_MAX_TOKENS_DEFAULT,
 };
-use serde_json::{json, Value};
+use serde_json::json;
 use tracing::warn;
 
 use crate::ops::{conversation_kv_key, plan_vllm_prefill, ConversationKvState};
@@ -44,7 +45,8 @@ pub struct OpeInferenceOptions {
     pub vllm_api_key: Option<String>,
     pub vllm: VllmChatClient,
     pub chunk_chars: usize,
-    pub kv: Option<std::sync::Mutex<std::collections::HashMap<String, ConversationKvState>>>,
+    /// Shared across pull workers so KV prefill warms survive session affinity.
+    pub kv: Option<Arc<std::sync::Mutex<std::collections::HashMap<String, ConversationKvState>>>>,
     /// Ed25519 signing key for usage reports (required for non-empty usage headers).
     pub usage_signing_key: Option<ed25519_dalek::SigningKey>,
 }
@@ -79,22 +81,6 @@ fn strip_model_provider(model: &str) -> String {
         Some(at) => model[..at].to_string(),
         None => model.to_string(),
     }
-}
-
-fn prompt_tokens_from_messages(messages: &[Value]) -> u64 {
-    let text: String = messages
-        .iter()
-        .map(|m| {
-            m.get("content")
-                .map(|c| match c {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-                .unwrap_or_default()
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    tokens_from_text(&text)
 }
 
 /// Decrypt → vLLM stream → encrypt OPE response chunks (JSON or NDJSON).
@@ -176,12 +162,14 @@ pub async fn run_ope_inference_on_envelope(
         .or_else(|| envelope.meta.as_ref().and_then(|m| m.model.as_deref()))
         .unwrap_or("unknown");
     let model = strip_model_provider(model_raw);
-    let messages = payload
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let prompt_tokens = prompt_tokens_from_messages(&messages);
+    let messages = normalize_vllm_messages(
+        payload
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]),
+    );
+    let prompt_tokens = estimate_prompt_tokens_from_messages(&messages);
 
     let hash = {
         use sha2::{Digest, Sha256};

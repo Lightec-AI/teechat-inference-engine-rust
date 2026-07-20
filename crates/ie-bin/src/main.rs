@@ -1,20 +1,21 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 use ie_attestation::{
-    build_engine_attestation_bundle, load_tcb_pins, validate_tcb_pins,
+    build_engine_attestation_bundle, create_engine_attestation_refresher, load_tcb_pins,
+    validate_tcb_pins, EngineAttestationRefreshContext,
 };
 use ie_crypto::{MockCryptoProvider, RealCryptoProvider};
 use ie_engine::{
     configure_event_log_from_env, engine_instance_id_from_env, epoch_rotation_policy_from_env,
-    generate_gateway_connect_challenge_nonce, install_engine_controls, start_pull_worker,
-    EnginePlaneDialOptions, EphemeralPoster, EpochRotatedCallback, EpochRotator, EpochRotatorSession,
-    Http2EnginePlaneConnector, NonceEchoGatewayAttestationVerifier, OpeInferenceOptions,
-    PullWorkerHandle, RotatingEpochDecryptor, SupervisedPool, SupervisedPoolConfig,
+    generate_gateway_connect_challenge_nonce, install_engine_controls, platform_policy_verifier_from_env,
+    start_pull_worker, EnginePlaneDialOptions, EphemeralPoster, EpochRotatedCallback, EpochRotator,
+    EpochRotatorSession, Http2EnginePlaneConnector, OpeInferenceOptions, PullWorkerHandle,
+    RotatingEpochDecryptor, SupervisedPool, SupervisedPoolConfig,
 };
 use ie_protocol::{AttestedConnectRequest, EngineEphemeralRegisterRequest};
 use ie_runtime::{env_map_from_process, load_engine_env_files, load_engine_plane_client_tls};
@@ -352,7 +353,7 @@ async fn run_engine(
         })?;
         let verifier: Option<Arc<dyn ie_engine::GatewayAttestationVerifier>> =
             if verify_gateway_platform_enabled(env) {
-                Some(Arc::new(NonceEchoGatewayAttestationVerifier))
+                Some(Arc::new(platform_policy_verifier_from_env(env)))
             } else {
                 eprintln!(
                     "[inference-engine] WARNING: TEECHAT_ENGINE_VERIFY_GATEWAY_PLATFORM=0 — SEC-029 verify disabled"
@@ -436,6 +437,22 @@ async fn run_engine(
         rotator.start().await;
         rotator_handle = Some(Arc::clone(&rotator));
 
+        // Remint attestation on later scale/migrate (parity with TS applyFreshAttestation).
+        let refresh_inner = create_engine_attestation_refresher(EngineAttestationRefreshContext {
+            ed25519_public: ed25519_public_b64.clone(),
+            tls_client_cert_sha256: tls_cert_sha.clone(),
+            root: PathBuf::from(cwd),
+            env: env.clone(),
+        });
+        let rotator_for_refresh = Arc::clone(&rotator);
+        pool.set_attestation_refresh(Some(Arc::new(move || {
+            let bundle = refresh_inner().map_err(|e| e.to_string())?;
+            rotator_for_refresh.set_attestation(bundle.clone());
+            Ok(bundle)
+        })))
+        .await;
+
+        let shared_kv = Arc::new(Mutex::new(HashMap::new()));
         let inference_template = OpeInferenceOptions {
             request_id: None,
             decrypt_handle: 0,
@@ -448,7 +465,7 @@ async fn run_engine(
                 .get("TEECHAT_ENGINE_CHUNK_CHARS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8),
-            kv: Some(Mutex::new(HashMap::new())),
+            kv: Some(Arc::clone(&shared_kv)),
             usage_signing_key: Some(signing_key),
         };
 
@@ -469,7 +486,7 @@ async fn run_engine(
                     vllm_api_key: inference_template.vllm_api_key.clone(),
                     vllm: VllmChatClient::default(),
                     chunk_chars: inference_template.chunk_chars,
-                    kv: None,
+                    kv: Some(Arc::clone(&shared_kv)),
                     usage_signing_key: inference_template.usage_signing_key.clone(),
                 },
             ));

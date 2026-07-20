@@ -163,7 +163,7 @@ async fn pull_once(
         vllm_api_key: inference.vllm_api_key.clone(),
         vllm: VllmChatClient::default(),
         chunk_chars: inference.chunk_chars,
-        kv: None,
+        kv: inference.kv.clone(),
         usage_signing_key: inference.usage_signing_key.clone(),
     };
 
