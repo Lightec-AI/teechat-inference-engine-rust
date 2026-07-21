@@ -12,6 +12,9 @@ use crate::config::SupervisedPoolConfig;
 use crate::cutover::{plan_pool_drain, plan_pool_scale};
 use crate::error::EngineError;
 use crate::gateway_migration::plan_gateway_migration;
+use crate::pull_workers::{
+    warn_pull_worker_start, PullWorkerRegistry, PullWorkerStartFn, SessionsChangedFn,
+};
 use crate::traits::{ConnectResult, EnginePlaneConnector, InferenceUpstream, InferResult};
 
 /// Remint attestation before reconnect / scale / migrate (optional).
@@ -85,6 +88,10 @@ pub struct SupervisedPool {
     connect_template: RwLock<Option<AttestedConnectRequest>>,
     /// Optional remint hook (parity with TS `applyFreshAttestation`).
     attestation_refresh: RwLock<Option<AttestationRefreshFn>>,
+    /// Pull workers owned like TS `SessionSlot.pullWorker`.
+    workers: PullWorkerRegistry,
+    /// Notify epoch rotator / ops when live session ids change.
+    on_sessions_changed: RwLock<Option<SessionsChangedFn>>,
     state: RwLock<PoolState>,
 }
 
@@ -106,6 +113,8 @@ impl SupervisedPool {
             upstream,
             connect_template: RwLock::new(None),
             attestation_refresh: RwLock::new(None),
+            workers: PullWorkerRegistry::new(),
+            on_sessions_changed: RwLock::new(None),
             state: RwLock::new(PoolState::default()),
         }
     }
@@ -113,6 +122,51 @@ impl SupervisedPool {
     /// Install / replace attestation remint used on scale + migrate (+ reconnect paths).
     pub async fn set_attestation_refresh(&self, refresh: Option<AttestationRefreshFn>) {
         *self.attestation_refresh.write().await = refresh;
+    }
+
+    /// Register pull-worker factory (required for live H2; unit tests leave unset).
+    pub async fn set_pull_worker_start_fn(&self, start_fn: Option<PullWorkerStartFn>) {
+        self.workers.set_start_fn(start_fn).await;
+    }
+
+    pub async fn set_on_sessions_changed(&self, cb: Option<SessionsChangedFn>) {
+        *self.on_sessions_changed.write().await = cb;
+    }
+
+    pub fn workers(&self) -> &PullWorkerRegistry {
+        &self.workers
+    }
+
+    async fn notify_sessions_changed(&self) {
+        let ids = self.session_ids().await;
+        if let Some(cb) = self.on_sessions_changed.read().await.clone() {
+            cb(ids);
+        }
+    }
+
+    /// Busy = live pull worker busy (TS), else slot flag (tests without workers).
+    async fn session_is_busy(&self, session_id: &str) -> bool {
+        if self.workers.has_worker(session_id).await {
+            return self.workers.is_busy(session_id).await;
+        }
+        let state = self.state.read().await;
+        state
+            .slots
+            .iter()
+            .find(|s| s.session.session_id == session_id)
+            .map(|s| s.busy.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    async fn idle_session_ids(&self) -> Vec<String> {
+        let ids = self.session_ids().await;
+        let mut idle = Vec::new();
+        for id in ids {
+            if !self.session_is_busy(&id).await {
+                idle.push(id);
+            }
+        }
+        idle
     }
 
     async fn apply_fresh_attestation(
@@ -189,6 +243,10 @@ impl SupervisedPool {
                     },
                     busy: AtomicBool::new(false),
                 });
+                if let Err(err) = self.workers.ensure_started(&result.session_id).await {
+                    warn_pull_worker_start(&result.session_id, &err);
+                }
+                self.notify_sessions_changed().await;
                 Ok(result)
             }
             Err(err) => {
@@ -241,24 +299,16 @@ impl SupervisedPool {
         counts
     }
 
-    pub fn set_session_busy(&self, session_id: &str, busy: bool) {
-        let state = self.state.try_read();
-        if let Ok(state) = state {
-            if let Some(slot) = state
-                .slots
-                .iter()
-                .find(|s| s.session.session_id == session_id)
-            {
-                slot.busy.store(busy, Ordering::SeqCst);
-            }
-        }
-    }
-
-    fn idle_count(slots: &[SessionSlot]) -> u32 {
-        slots
+    /// Mark slot busy (tests / fallback when no pull worker is registered).
+    pub async fn set_session_busy(&self, session_id: &str, busy: bool) {
+        let state = self.state.read().await;
+        if let Some(slot) = state
+            .slots
             .iter()
-            .filter(|s| !s.busy.load(Ordering::SeqCst))
-            .count() as u32
+            .find(|s| s.session.session_id == session_id)
+        {
+            slot.busy.store(busy, Ordering::SeqCst);
+        }
     }
 
     pub async fn infer_via_upstream(
@@ -328,9 +378,9 @@ impl SupervisedPool {
         count: Option<u32>,
         fraction: Option<f64>,
     ) -> Result<PoolDrainResult, EngineError> {
-        let mut state = self.state.write().await;
-        let current = state.slots.len() as u32;
-        let idle = Self::idle_count(&state.slots);
+        let current = self.live_session_count().await;
+        let idle_ids = self.idle_session_ids().await;
+        let idle = idle_ids.len() as u32;
         let plan = plan_pool_drain(
             self.config.pool_target_size,
             current,
@@ -340,25 +390,28 @@ impl SupervisedPool {
         );
 
         let mut drained = 0u32;
-        for _ in 0..plan.to_drain {
-            let index = state
-                .slots
-                .iter()
-                .position(|s| !s.busy.load(Ordering::SeqCst));
-            let Some(index) = index else {
-                break;
-            };
-            let session_id = state.slots[index].session.session_id.clone();
-            drop(state);
+        for session_id in idle_ids.into_iter().take(plan.to_drain as usize) {
+            // TS drainSlotAt: stop pull worker, then disconnect, then remove slot.
+            if self.session_is_busy(&session_id).await {
+                continue;
+            }
+            self.workers.stop_session(&session_id).await;
             if let Err(err) = self.connector.disconnect(&session_id).await {
                 warn!(session_id = %session_id, error = %err, "disconnect failed during drain");
             }
-            state = self.state.write().await;
-            state.slots.remove(index);
-            drained += 1;
+            let mut state = self.state.write().await;
+            if let Some(index) = state
+                .slots
+                .iter()
+                .position(|s| s.session.session_id == session_id)
+            {
+                state.slots.remove(index);
+                drained += 1;
+            }
         }
 
-        let remaining = state.slots.len() as u32;
+        self.notify_sessions_changed().await;
+        let remaining = self.live_session_count().await;
         Ok(PoolDrainResult {
             drained,
             remaining,
@@ -390,25 +443,47 @@ impl SupervisedPool {
             .iter()
             .filter(|s| s.session.gateway_base_url == normalized)
             .count() as u32;
-        let idle_on_source = state
-            .slots
-            .iter()
-            .filter(|s| s.session.gateway_base_url != normalized && !s.busy.load(Ordering::SeqCst))
-            .count() as u32;
-        let plan = plan_gateway_migration(pool_size, on_target, fraction, idle_on_source);
         drop(state);
+
+        let source_ids: Vec<(usize, String)> = {
+            let state = self.state.read().await;
+            state
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.session.gateway_base_url != normalized)
+                .map(|(i, s)| (i, s.session.session_id.clone()))
+                .collect()
+        };
+        let mut idle_on_source = 0u32;
+        for (_, id) in &source_ids {
+            if !self.session_is_busy(id).await {
+                idle_on_source += 1;
+            }
+        }
+        let plan = plan_gateway_migration(pool_size, on_target, fraction, idle_on_source);
 
         let mut moved = 0u32;
         for _ in 0..plan.to_move {
-            let (index, old_session_id) = {
+            let candidates: Vec<(usize, String)> = {
                 let state = self.state.read().await;
-                let found = state.slots.iter().enumerate().find(|(_, s)| {
-                    s.session.gateway_base_url != normalized && !s.busy.load(Ordering::SeqCst)
-                });
-                match found {
-                    Some((i, s)) => (i, s.session.session_id.clone()),
-                    None => break,
+                state
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.session.gateway_base_url != normalized)
+                    .map(|(i, s)| (i, s.session.session_id.clone()))
+                    .collect()
+            };
+            let mut found = None;
+            for (i, sid) in candidates {
+                if !self.session_is_busy(&sid).await {
+                    found = Some((i, sid));
+                    break;
                 }
+            }
+            let Some((index, old_session_id)) = found else {
+                break;
             };
 
             let mut req = template.clone();
@@ -425,27 +500,29 @@ impl SupervisedPool {
                     return Err(EngineError::Connect(err.to_string()));
                 }
             };
+            let new_session_id = new_conn.session_id.clone();
 
+            // Stop source puller before disconnect (TS migrateOneSession).
+            self.workers.stop_session(&old_session_id).await;
             if let Err(err) = self.connector.disconnect(&old_session_id).await {
                 warn!(
                     session_id = %old_session_id,
                     error = %err,
                     "migrate source disconnect failed; keeping both sessions mapped carefully"
                 );
-                // Still update source slot to avoid double-counting; target session is live.
             }
 
             let mut state = self.state.write().await;
             if let Some(slot) = state.slots.get_mut(index) {
                 if slot.session.session_id == old_session_id {
-                    slot.session.session_id = new_conn.session_id;
+                    slot.session.session_id = new_session_id.clone();
                     slot.session.gateway_base_url = normalized.clone();
+                    slot.busy.store(false, Ordering::SeqCst);
                     moved += 1;
                 } else {
-                    // Slot changed concurrently — track new session as additional.
                     state.slots.push(SessionSlot {
                         session: PoolSession {
-                            session_id: new_conn.session_id,
+                            session_id: new_session_id.clone(),
                             gateway_base_url: normalized.clone(),
                         },
                         busy: AtomicBool::new(false),
@@ -453,10 +530,16 @@ impl SupervisedPool {
                     moved += 1;
                 }
             }
+            drop(state);
+
+            if let Err(err) = self.workers.ensure_started(&new_session_id).await {
+                warn_pull_worker_start(&new_session_id, &err);
+            }
         }
 
         if moved > 0 {
             *self.gateway_base_url.write().await = normalized.clone();
+            self.notify_sessions_changed().await;
         }
 
         let state = self.state.read().await;
@@ -480,11 +563,14 @@ impl SupervisedPool {
     pub async fn close_all(&self) -> Result<(), EngineError> {
         let ids: Vec<String> = self.session_ids().await;
         for id in ids {
+            self.workers.stop_session(&id).await;
             if let Err(err) = self.connector.disconnect(&id).await {
                 warn!(session_id = %id, error = %err, "disconnect failed during pool close");
             }
         }
+        self.workers.stop_all().await;
         self.state.write().await.slots.clear();
+        self.notify_sessions_changed().await;
         Ok(())
     }
 }
@@ -619,6 +705,8 @@ mod tests {
         SupervisedPoolConfig {
             pool_target_size: 4,
             pool_initial_fraction: 0.5,
+            pool_initial_fraction_explicit: true,
+            pool_baseline: 4,
             supervised: true,
             reconnect: PoolReconnectConfig::default(),
         }
@@ -642,6 +730,8 @@ mod tests {
             SupervisedPoolConfig {
                 pool_target_size: 2,
                 pool_initial_fraction: 1.0,
+                pool_initial_fraction_explicit: true,
+                pool_baseline: 4,
                 supervised: true,
                 reconnect: PoolReconnectConfig::default(),
             },
@@ -656,11 +746,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drain_skips_busy_sessions() {
+        let pool = Arc::new(SupervisedPool::new(
+            SupervisedPoolConfig {
+                pool_target_size: 2,
+                pool_initial_fraction: 1.0,
+                pool_initial_fraction_explicit: true,
+                pool_baseline: 4,
+                supervised: true,
+                reconnect: PoolReconnectConfig::default(),
+            },
+            "https://gateway.example",
+            Arc::new(MockConnector),
+            Arc::new(MockUpstream),
+        ));
+        pool.boot(sample_request()).await.unwrap();
+        let ids = pool.session_ids().await;
+        assert_eq!(ids.len(), 2);
+        pool.set_session_busy(&ids[0], true).await;
+        let result = pool.drain_idle_sessions(2).await.unwrap();
+        assert_eq!(result.drained, 1);
+        assert_eq!(result.remaining, 1);
+        assert!(pool.session_ids().await.contains(&ids[0]));
+    }
+
+    #[tokio::test]
     async fn migrate_gateway_pool_moves_idle_sessions() {
         let pool = Arc::new(SupervisedPool::new(
             SupervisedPoolConfig {
                 pool_target_size: 4,
                 pool_initial_fraction: 1.0,
+                pool_initial_fraction_explicit: true,
+                pool_baseline: 4,
                 supervised: true,
                 reconnect: PoolReconnectConfig::default(),
             },

@@ -11,6 +11,9 @@ use tokio::time::sleep;
 pub const DEFAULT_POOL_CONNECT_CONCURRENCY: u32 = 2;
 pub const DEFAULT_POOL_CONNECT_STAGGER_MS: u64 = 150;
 
+/// Minimum live sessions when applying gateway desired-pool hints (default 4).
+pub const DEFAULT_ENGINE_POOL_BASELINE: u32 = 4;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PoolDrainPlan {
     pub target_remaining: u32,
@@ -211,6 +214,40 @@ pub fn pool_initial_fraction_from_env(env: &HashMap<String, String>) -> f64 {
     }
 }
 
+pub fn pool_baseline_from_env(env: &HashMap<String, String>) -> u32 {
+    let raw = env
+        .get("TEECHAT_ENGINE_POOL_BASELINE")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let Some(raw) = raw else {
+        return DEFAULT_ENGINE_POOL_BASELINE;
+    };
+    raw.parse::<u32>()
+        .ok()
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_ENGINE_POOL_BASELINE)
+}
+
+/// Boot session count: explicit `INITIAL_FRACTION` wins; otherwise `min(baseline, poolTargetSize)`.
+pub fn boot_pool_session_count(
+    pool_target_size: u32,
+    env: &HashMap<String, String>,
+    pool_initial_fraction: Option<f64>,
+) -> u32 {
+    if pool_target_size < 1 {
+        return 0;
+    }
+    let fraction_explicit = env
+        .get("TEECHAT_ENGINE_POOL_INITIAL_FRACTION")
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if pool_initial_fraction.is_some() || fraction_explicit {
+        let fraction = pool_initial_fraction.unwrap_or_else(|| pool_initial_fraction_from_env(env));
+        return initial_pool_session_count(pool_target_size, fraction);
+    }
+    pool_baseline_from_env(env).min(pool_target_size)
+}
+
 pub fn pool_connect_concurrency_from_env(env: &HashMap<String, String>, session_count: u32) -> u32 {
     if session_count < 1 {
         return 1;
@@ -333,6 +370,29 @@ mod tests {
     #[test]
     fn initial_pool_session_count_halves_n4() {
         assert_eq!(initial_pool_session_count(4, 0.5), 2);
+    }
+
+    #[test]
+    fn boot_defaults_to_baseline() {
+        let env = HashMap::new();
+        assert_eq!(pool_baseline_from_env(&env), 4);
+        assert_eq!(boot_pool_session_count(32, &env, None), 4);
+        assert_eq!(boot_pool_session_count(2, &env, None), 2);
+    }
+
+    #[test]
+    fn boot_respects_explicit_initial_fraction() {
+        let mut env = HashMap::new();
+        env.insert(
+            "TEECHAT_ENGINE_POOL_INITIAL_FRACTION".into(),
+            "0".into(),
+        );
+        assert_eq!(boot_pool_session_count(32, &env, None), 0);
+        env.insert(
+            "TEECHAT_ENGINE_POOL_INITIAL_FRACTION".into(),
+            "0.5".into(),
+        );
+        assert_eq!(boot_pool_session_count(32, &env, None), 16);
     }
 
     #[test]

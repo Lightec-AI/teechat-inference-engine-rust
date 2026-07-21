@@ -13,6 +13,9 @@ use ie_protocol::{
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
+use crate::desired_pool::{
+    parse_desired_pool_target_header, DesiredPoolTargetCallback, HEADER_OPE_DESIRED_POOL_TARGET,
+};
 use crate::infer::{
     is_gateway_plane_task_envelope, run_ope_inference_on_envelope, NdjsonStreamWriter,
     OpeInferenceOptions, validate_ope_inference_envelope, GateResult,
@@ -50,6 +53,7 @@ pub fn start_pull_worker(
     transport: Arc<dyn PlaneTransport>,
     session_id: String,
     inference: OpeInferenceOptions,
+    on_desired_pool_target: Option<DesiredPoolTargetCallback>,
 ) -> PullWorkerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let busy = Arc::new(AtomicBool::new(false));
@@ -65,13 +69,15 @@ pub fn start_pull_worker(
                 &session_id,
                 &inference,
                 busy_c.clone(),
+                on_desired_pool_target.as_ref(),
             )
             .await
             {
                 Ok(WorkPullOutcome::Idle) => {
+                    // Idle 204 / empty: re-poll quickly (TS uses setImmediate).
                     tokio::select! {
                         _ = notify_c.notified() => {}
-                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                        _ = tokio::time::sleep(Duration::from_millis(1)) => {}
                     }
                 }
                 Ok(WorkPullOutcome::Processed) => {}
@@ -101,6 +107,7 @@ async fn pull_once(
     session_id: &str,
     inference: &OpeInferenceOptions,
     busy: Arc<AtomicBool>,
+    on_desired_pool_target: Option<&DesiredPoolTargetCallback>,
 ) -> Result<WorkPullOutcome, PlaneError> {
     let resp = transport
         .request_bytes(
@@ -111,6 +118,14 @@ async fn pull_once(
             &[(HEADER_OPE_SESSION_ID, session_id)],
         )
         .await?;
+
+    if let Some(desired) =
+        parse_desired_pool_target_header(resp.header_value(HEADER_OPE_DESIRED_POOL_TARGET))
+    {
+        if let Some(cb) = on_desired_pool_target {
+            cb(desired);
+        }
+    }
 
     if resp.status != 200 || resp.body.is_empty() {
         return Ok(WorkPullOutcome::Idle);

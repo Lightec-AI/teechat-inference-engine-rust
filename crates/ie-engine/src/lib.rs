@@ -3,6 +3,7 @@
 mod config;
 mod controls;
 mod cutover;
+mod desired_pool;
 mod epoch;
 mod error;
 mod gateway_migration;
@@ -10,6 +11,7 @@ mod infer;
 mod ops;
 mod plane;
 mod pool;
+mod pull_workers;
 mod traits;
 
 pub use config::{PoolReconnectConfig, SupervisedPoolConfig};
@@ -22,11 +24,16 @@ pub use controls::{
     PoolStatusControl, ENGINE_POOL_STATUS_SCHEMA,
 };
 pub use cutover::{
-    create_pool_connect_throttle_from_env, initial_pool_session_count, map_with_concurrency,
-    parse_pool_drain_request_json, parse_pool_scale_request_json, plan_pool_drain,
-    plan_pool_scale, pool_connect_concurrency_from_env, pool_connect_stagger_ms_from_env,
-    pool_initial_fraction_from_env, PoolConnectThrottle, PoolDrainPlan, PoolDrainRequest,
-    PoolScalePlan, PoolScaleRequest,
+    boot_pool_session_count, create_pool_connect_throttle_from_env, initial_pool_session_count,
+    map_with_concurrency, parse_pool_drain_request_json, parse_pool_scale_request_json,
+    plan_pool_drain, plan_pool_scale, pool_baseline_from_env, pool_connect_concurrency_from_env,
+    pool_connect_stagger_ms_from_env, pool_initial_fraction_from_env, PoolConnectThrottle,
+    PoolDrainPlan, PoolDrainRequest, PoolScalePlan, PoolScaleRequest, DEFAULT_ENGINE_POOL_BASELINE,
+};
+pub use desired_pool::{
+    apply_desired_pool_target, clamp_desired_pool_target, parse_desired_pool_target_header,
+    spawn_desired_pool_applier, DesiredPoolTargetCallback, DESIRED_POOL_DEBOUNCE_MS,
+    HEADER_OPE_DESIRED_POOL_TARGET,
 };
 pub use epoch::{
     compute_epoch_rotate_at_ms, create_engine_epoch, dispose_engine_epoch, epoch_rotation_lead_ms_from_env,
@@ -64,5 +71,8 @@ pub use plane::{
 pub use pool::{
     sessions_by_gateway_url_from_slots, AttestationRefreshFn, GatewayMigrationResult,
     PoolDrainResult, PoolScaleResult, PoolSession, SupervisedPool, SupervisedPoolHandle,
+};
+pub use pull_workers::{
+    PullWorkerRegistry, PullWorkerStartFn, PullWorkerStartFuture, SessionsChangedFn,
 };
 pub use traits::{ConnectResult, EnginePlaneConnector, InferResult, InferenceUpstream};
