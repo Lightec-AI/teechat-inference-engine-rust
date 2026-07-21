@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use clap::Parser;
@@ -447,6 +448,7 @@ async fn run_engine(
 
     let live_sessions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let mut rotator_handle: Option<Arc<EpochRotator>> = None;
+    let mut prune_task: Option<tokio::task::JoinHandle<()>> = None;
 
     if let Some(h2) = h2 {
         pool.set_on_sessions_changed(Some(Arc::new({
@@ -562,6 +564,23 @@ async fn run_engine(
         rotator.start().await;
         pool.start_session_watch().await;
         rotator_handle = Some(Arc::clone(&rotator));
+
+        // Drop retired epochs past overlap grace (TS `pruneTimer`, 60s).
+        {
+            let prune_decryptor = Arc::clone(&decryptor);
+            prune_task = Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                interval.tick().await; // skip immediate first tick
+                loop {
+                    interval.tick().await;
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    prune_decryptor.prune_retired(now_ms, None);
+                }
+            }));
+        }
     } else {
         pool.boot(connect).await?;
     }
@@ -576,6 +595,9 @@ async fn run_engine(
     println!("[inference-engine] supervised pool running — Ctrl+C to stop");
 
     signal::ctrl_c().await?;
+    if let Some(task) = prune_task {
+        task.abort();
+    }
     if let Some(r) = rotator_handle {
         r.stop().await;
     }
