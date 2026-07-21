@@ -1,7 +1,7 @@
 # Tag release: build measured Rust InferenceEngine linux-amd64 runtime bundle.
 #
 # Primary attestation: engine.binary_sha256 = SHA-256 of inference-engine-runtime-*.tar.gz
-# Tag with canary/train semver (e.g. v0.9.0-rust-canary).
+# Tag with train semver (e.g. v0.9.3).
 
 name: Release
 
@@ -52,6 +52,6 @@ jobs:
             - OPE FFI / attested-mtls digests are recorded independently in `RELEASE_MANIFEST.json`
               (from `config/tcb-pins.json`); verify those TCBs on their own GitHub Releases.
 
-            Staging canary only — see `docs/CANARY.md`. Do not promote to prod without runbook sign-off.
+            Install and blue/green cutover: TeeChat `docs/ops/engine-blue-green-cutover.md` (Rust IE train).
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

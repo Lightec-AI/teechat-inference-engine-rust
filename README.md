@@ -38,12 +38,9 @@ cargo run -p ie-bin -- --run
 
 ## Status
 
-Capable of supervised pool boot, work-pull OPE inference, epoch rotation, attestation remint on scale/migrate, and SEC-029 gateway platform verify (env-gated). Staging canary: [`docs/CANARY.md`](docs/CANARY.md).
+Capable of supervised pool boot, work-pull OPE inference, epoch rotation, attestation remint on scale/migrate, and SEC-029 gateway platform verify (env-gated).
 
-### Explicit non-goals (until TeaChat ops asks)
-
-- No replace of `engine-prod-1` / no production blue-green cutover
-- No TeeChat `minor-release` packaging of Rust IE as default prod engine
+**Release:** tag `vX.Y.Z` → Actions packs `inference-engine-runtime-*.tar.gz` + `SHA256SUMS` + `RELEASE_MANIFEST.json`. Production install and blue/green cutover are owned by the **TeeChat** ops tree (not this repo).
 
 ## License
 

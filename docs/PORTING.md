@@ -13,8 +13,8 @@ This document tracks what is ported in **teechat-inference-engine-rust** and wha
 | **M3** | supervised pool, epoch, drain/scale/status/migrate/cutover | **Done** |
 | **M4** | SEV-SNP + NV-CC backends + policy/fixture tests | **Done** |
 | **M5** | `ie-bin` run-engine parity + measured release packaging | **Done** |
-| **M6** | staging smoke + `engine-rust-canary` install docs (**no prod install**) | **Done** — see [`CANARY.md`](CANARY.md) |
-| **M7** | metering/prefill/ops leftovers + full test matrix vs TS `test/` | **Done** — see [`TEST_MATRIX.md`](TEST_MATRIX.md) |
+| **M6** | measured release packaging + GH Release assets | **Done** — `scripts/pack-runtime.sh` + `.github/workflows/release.yml` |
+| **M7** | metering/prefill leftovers + full test matrix vs TS `test/` | **Done** — see [`TEST_MATRIX.md`](TEST_MATRIX.md) |
 
 Gate each milestone: `cargo test --workspace` + `cargo clippy --workspace --all-targets -- -D warnings`.
 
@@ -55,12 +55,10 @@ Gate each milestone: `cargo test --workspace` + `cargo clippy --workspace --all-
 2. **`ope.libope_ffi_sha256`** — independent OPE FFI TCB from `config/tcb-pins.json` / env overrides.
 3. **`attested_mtls.lib_attested_mtls_sha256`** — independent attested-mtls native library TCB.
 
-## Explicit non-goals (ops)
+## Repo boundary
 
-- No replace of `engine-prod-1` / no blue-green cutover of TS IE until TeaChat ops runbook + preflight
-- No TeeChat `minor-release` packaging of Rust IE as the default prod engine
-- No fail-closed client changes that require Rust-only claims
-- Reserved canary id: `TEECHAT_OPE_ENGINE_ID=engine-rust-canary` — see [`CANARY.md`](CANARY.md)
+This repository owns engine **code**, unit/integration tests, and measured **pack/release** scripts.
+Production install, blue/green cutover, and platform-manifest sync live in **TeeChat** `scripts/ops/` / `docs/ops/`.
 
 ## Recent parity closes (post-M7)
 
