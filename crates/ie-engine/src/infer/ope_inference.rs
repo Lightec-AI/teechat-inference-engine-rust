@@ -210,17 +210,15 @@ pub async fn run_ope_inference_on_envelope(
     let mut seq: u32 = 0;
     let streaming = ndjson_out.is_some();
 
-    if let Some(out) = ndjson_out.as_mut() {
-        if let Ok(line) = encode_ope_stream_line(&OpeStreamFrame::server_share(&resp.server_share)) {
-            out.write(&line);
-        }
-    }
-
     let max_tokens = payload
         .get("max_tokens")
         .and_then(|v| v.as_u64())
         .map(|n| clamp_vllm_max_tokens(n as u32));
 
+    // Open vLLM *before* writing any OPE stream bytes. Previously we emitted
+    // `server_share` first, then on context-length / upstream HTTP errors still
+    // finished an empty `ope+json-stream` with x-ope-status 200 — OpenAPI
+    // synthesized HTTP 200 + empty assistant content (silent drop for long context).
     let stream = options
         .vllm
         .stream_chat_completion(VllmStreamOptions {
@@ -244,23 +242,16 @@ pub async fn run_ope_inference_on_envelope(
         Ok(s) => s,
         Err(e) => {
             options.provider.free_response(resp.session);
-            if streaming {
-                return OpeInferenceResult {
-                    status: 502,
-                    content_type: CONTENT_TYPE_OPE_JSON_STREAM.into(),
-                    body: String::new(),
-                    usage_header: None,
-                };
-            }
-            return OpeInferenceResult {
-                status: 502,
-                content_type: "application/json".into(),
-                body: json!({ "error": "vllm_upstream_failed", "detail": e.to_string() })
-                    .to_string(),
-                usage_header: None,
-            };
+            return vllm_upstream_failed_result(&e);
         }
     };
+
+    // vLLM accepted the request — now it is safe to start the OPE ciphertext stream.
+    if let Some(out) = ndjson_out.as_mut() {
+        if let Ok(line) = encode_ope_stream_line(&OpeStreamFrame::server_share(&resp.server_share)) {
+            out.write(&line);
+        }
+    }
 
     tokio::pin!(stream);
     while let Some(item) = stream.next().await {
@@ -286,7 +277,9 @@ pub async fn run_ope_inference_on_envelope(
             Err(e) => {
                 options.provider.free_response(resp.session);
                 warn!(error = %e, "vllm stream error");
-                if streaming {
+                // If we already wrote ciphertext, pull finishes the open stream (partial
+                // tokens). JSON error is only useful when nothing was flushed yet.
+                if streaming && seq > 0 {
                     return OpeInferenceResult {
                         status: 502,
                         content_type: CONTENT_TYPE_OPE_JSON_STREAM.into(),
@@ -294,13 +287,7 @@ pub async fn run_ope_inference_on_envelope(
                         usage_header: None,
                     };
                 }
-                return OpeInferenceResult {
-                    status: 502,
-                    content_type: "application/json".into(),
-                    body: json!({ "error": "vllm_upstream_failed", "detail": e.to_string() })
-                        .to_string(),
-                    usage_header: None,
-                };
+                return vllm_upstream_failed_result(&e);
             }
         }
     }
@@ -377,6 +364,21 @@ pub async fn run_ope_inference_on_envelope(
         })
         .to_string(),
         usage_header,
+    }
+}
+
+fn vllm_upstream_failed_result(err: &ie_upstream::UpstreamError) -> OpeInferenceResult {
+    let status = match err {
+        ie_upstream::UpstreamError::Http { status, .. } if (400..500).contains(status) => *status,
+        _ => 502,
+    };
+    OpeInferenceResult {
+        status,
+        // Must NOT be ope+json-stream: pull aborts the speculative stream open and
+        // re-POSTs this JSON with the real x-ope-status (see plane/pull.rs).
+        content_type: "application/json".into(),
+        body: json!({ "error": "vllm_upstream_failed", "detail": err.to_string() }).to_string(),
+        usage_header: None,
     }
 }
 

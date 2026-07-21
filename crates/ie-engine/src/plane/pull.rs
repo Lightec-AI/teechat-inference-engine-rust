@@ -279,10 +279,14 @@ async fn pull_once(
         )
         .await;
 
-        if result.content_type.contains("ope+json-stream") {
+        // Only finish the speculative stream when inference actually produced a
+        // successful OPE stream. Upstream failures (e.g. vLLM 400 context length)
+        // return application/json + 4xx/5xx — abort and re-POST so x-ope-status
+        // matches (headers on the first open are already committed as 200).
+        let stream_ok = result.status < 400 && result.content_type.contains("ope+json-stream");
+        if stream_ok {
             handle.finish().await?
         } else {
-            // Decrypt/upstream failed after stream open — abort and POST JSON error.
             handle.abort();
             let status_owned = result.status.to_string();
             let mut headers_owned: Vec<(String, String)> = vec![
