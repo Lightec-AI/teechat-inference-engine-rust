@@ -11,12 +11,12 @@ use ie_attestation::{
 };
 use ie_crypto::{MockCryptoProvider, RealCryptoProvider};
 use ie_engine::{
-    configure_event_log_from_env, engine_instance_id_from_env, epoch_rotation_policy_from_env,
-    generate_gateway_connect_challenge_nonce, install_engine_controls, platform_policy_verifier_from_env,
-    spawn_desired_pool_applier, start_pull_worker, DesiredPoolTargetCallback, EnginePlaneDialOptions,
-    EphemeralPoster, EpochRotatedCallback, EpochRotator, EpochRotatorSession,
-    Http2EnginePlaneConnector, OpeInferenceOptions, PullWorkerStartFn, RotatingEpochDecryptor,
-    SupervisedPool, SupervisedPoolConfig,
+    configure_event_log_from_env, create_pool_connect_throttle_from_env, engine_instance_id_from_env,
+    epoch_rotation_policy_from_env, generate_gateway_connect_challenge_nonce, install_engine_controls,
+    platform_policy_verifier_from_env, spawn_desired_pool_applier, start_pull_worker,
+    DesiredPoolTargetCallback, EnginePlaneDialOptions, EphemeralPoster, EpochRotatedCallback,
+    EpochRotator, EpochRotatorSession, Http2EnginePlaneConnector, OpeInferenceOptions,
+    PullWorkerStartFn, RotatingEpochDecryptor, SupervisedPool, SupervisedPoolConfig,
 };
 use ie_protocol::{AttestedConnectRequest, EngineEphemeralRegisterRequest};
 use ie_runtime::{env_map_from_process, load_engine_env_files, load_engine_plane_client_tls};
@@ -183,21 +183,30 @@ fn make_pull_worker_start_fn(
     h2: Arc<Http2EnginePlaneConnector>,
     inference_template: OpeInferenceOptions,
     on_desired: DesiredPoolTargetCallback,
+    pool: Arc<SupervisedPool>,
 ) -> PullWorkerStartFn {
     Arc::new(move |session_id: String| {
         let h2 = Arc::clone(&h2);
         let inference = clone_inference_options(&inference_template);
         let on_desired = Arc::clone(&on_desired);
+        let pool = Arc::clone(&pool);
         Box::pin(async move {
             let transport = h2
                 .transport(&session_id)
                 .await
                 .ok_or_else(|| format!("missing transport for session {session_id}"))?;
+            let on_lost = {
+                let pool = Arc::clone(&pool);
+                Arc::new(move |sid: String| {
+                    pool.notify_transport_lost(sid);
+                })
+            };
             Ok(start_pull_worker(
                 transport,
                 session_id,
                 inference,
                 Some(on_desired),
+                Some(on_lost),
             ))
         })
     })
@@ -423,12 +432,18 @@ async fn run_engine(
     // Keep dial-time target and supervised config aligned (OPE_ / ENGINE_ aliases).
     pool_config.pool_target_size = pool_target_size;
 
-    let pool = Arc::new(SupervisedPool::new(
-        pool_config.clone(),
-        gateway.clone(),
-        connector,
-        upstream,
-    ));
+    let pool = Arc::new(
+        SupervisedPool::new(
+            pool_config.clone(),
+            gateway.clone(),
+            connector,
+            upstream,
+        )
+        .with_connect_throttle(create_pool_connect_throttle_from_env(
+            env,
+            pool_target_size,
+        )),
+    );
 
     let live_sessions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let mut rotator_handle: Option<Arc<EpochRotator>> = None;
@@ -516,18 +531,36 @@ async fn run_engine(
         };
 
         let on_desired = spawn_desired_pool_applier(Arc::clone(&pool), pool_config.clone());
+        pool.set_on_session_ready(Some({
+            let rotator = Arc::clone(&rotator);
+            Arc::new(move |session_id: String| {
+                let rotator = Arc::clone(&rotator);
+                Box::pin(async move {
+                    rotator
+                        .register_epoch_on_session(&session_id)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+            })
+        }))
+        .await;
         pool.set_pull_worker_start_fn(Some(make_pull_worker_start_fn(
             Arc::clone(&h2),
             inference_template,
             on_desired,
+            Arc::clone(&pool),
         )))
         .await;
 
         // Boot after starter is installed so scale/ops paths share the same worker lifecycle.
         pool.boot(connect).await?;
 
-        rotator.register_initial_epoch().await?;
+        // Zero-boot staging has no sessions yet — epoch lands on first scale (TS parity).
+        if pool.live_session_count().await > 0 {
+            rotator.register_initial_epoch().await?;
+        }
         rotator.start().await;
+        pool.start_session_watch().await;
         rotator_handle = Some(Arc::clone(&rotator));
     } else {
         pool.boot(connect).await?;
