@@ -54,6 +54,7 @@ pub fn start_pull_worker(
     session_id: String,
     inference: OpeInferenceOptions,
     on_desired_pool_target: Option<DesiredPoolTargetCallback>,
+    on_transport_lost: Option<crate::pull_workers::TransportLostFn>,
 ) -> PullWorkerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let busy = Arc::new(AtomicBool::new(false));
@@ -64,6 +65,12 @@ pub fn start_pull_worker(
 
     let join = tokio::spawn(async move {
         while !stop_c.load(Ordering::SeqCst) {
+            if transport.is_closed() {
+                if let Some(cb) = &on_transport_lost {
+                    cb(session_id.clone());
+                }
+                break;
+            }
             match pull_once(
                 transport.as_ref(),
                 &session_id,
@@ -83,6 +90,12 @@ pub fn start_pull_worker(
                 Ok(WorkPullOutcome::Processed) => {}
                 Err(err) => {
                     warn!(error = %err, session_id = %session_id, "pull worker error");
+                    if transport.is_closed() {
+                        if let Some(cb) = &on_transport_lost {
+                            cb(session_id.clone());
+                        }
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }

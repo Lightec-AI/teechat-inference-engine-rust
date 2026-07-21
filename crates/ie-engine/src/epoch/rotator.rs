@@ -110,6 +110,22 @@ impl EpochRotator {
         self.post_epoch_to_sessions(&self.current_epoch()).await
     }
 
+    /// Register the current epoch on a single session (scale / reconnect).
+    pub async fn register_epoch_on_session(&self, session_id: &str) -> Result<(), EngineError> {
+        let epoch = self.current_epoch();
+        match self
+            .poster
+            .post_ephemeral(session_id, &epoch.ephemeral_request)
+            .await
+        {
+            Ok(201) => Ok(()),
+            Ok(status) => Err(EngineError::Epoch(format!(
+                "ephemeral register HTTP {status}"
+            ))),
+            Err(err) => Err(EngineError::Epoch(err)),
+        }
+    }
+
     pub async fn start(self: &Arc<Self>) {
         let this = Arc::clone(self);
         let handle = tokio::spawn(async move {

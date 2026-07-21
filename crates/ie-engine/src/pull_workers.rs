@@ -17,6 +17,14 @@ pub type PullWorkerStartFn = Arc<dyn Fn(String) -> PullWorkerStartFuture + Send 
 /// Optional callback when the live session id set changes (epoch rotator list).
 pub type SessionsChangedFn = Arc<dyn Fn(Vec<String>) + Send + Sync>;
 
+pub type SessionReadyFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
+/// Post current epoch ephemeral after connect / reconnect (TS `registerEpochOnSession`).
+pub type SessionReadyFn = Arc<dyn Fn(String) -> SessionReadyFuture + Send + Sync>;
+
+/// Notify supervised pool that an H2 transport died (triggers per-slot reconnect).
+pub type TransportLostFn = Arc<dyn Fn(String) + Send + Sync>;
+
 #[derive(Default)]
 pub struct PullWorkerRegistry {
     workers: Mutex<HashMap<String, PullWorkerHandle>>,

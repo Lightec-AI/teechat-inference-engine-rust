@@ -48,6 +48,10 @@ impl Http2EnginePlaneConnector {
         self.dial.lock().await.gateway_base_url = url.into();
     }
 
+    pub async fn gateway_base_url(&self) -> String {
+        self.dial.lock().await.gateway_base_url.clone()
+    }
+
     pub async fn transport(&self, session_id: &str) -> Option<Arc<dyn PlaneTransport>> {
         self.sessions
             .lock()
@@ -76,11 +80,10 @@ impl Http2EnginePlaneConnector {
         &self,
         gateway_base_url: Option<&str>,
         request: AttestedConnectRequest,
+        preserve_session_id: Option<String>,
     ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
-        // Match TS `createEnginePlanePoolClient`: every pooled dial gets a fresh session id.
-        // Reusing the connect template's session_id collapses the HashMap entry and leaves
-        // orphan H2 connections — work-pull then never completes (dispatch timeout).
-        let session_id = Uuid::new_v4().to_string();
+        // Fresh id for boot/scale/migrate. Reconnect keeps the slot session id (TS affinity).
+        let session_id = preserve_session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let mut dial = self.dial.lock().await.clone();
         if let Some(url) = gateway_base_url {
@@ -111,28 +114,11 @@ impl Http2EnginePlaneConnector {
             response,
         })
     }
-}
 
-#[async_trait]
-impl EnginePlaneConnector for Http2EnginePlaneConnector {
-    async fn connect(
-        &self,
-        request: AttestedConnectRequest,
-    ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
-        self.connect_inner(None, request).await
-    }
-
-    async fn connect_to(
-        &self,
-        gateway_base_url: &str,
-        request: AttestedConnectRequest,
-    ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
-        self.connect_inner(Some(gateway_base_url), request).await
-    }
-
-    async fn disconnect(
+    async fn disconnect_with_reason(
         &self,
         session_id: &str,
+        reason: AttestedDisconnectReason,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let session = self
             .sessions
@@ -146,12 +132,88 @@ impl EnginePlaneConnector for Http2EnginePlaneConnector {
         let result = graceful_disconnect_attested_session(
             &session,
             &engine_id,
-            AttestedDisconnectReason::Upgrade,
+            reason,
             self.disconnect_timeout,
             self.disconnect_poll,
         )
         .await;
         let _ = session.close().await;
         result.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+    }
+}
+
+#[async_trait]
+impl EnginePlaneConnector for Http2EnginePlaneConnector {
+    async fn connect(
+        &self,
+        request: AttestedConnectRequest,
+    ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
+        self.connect_inner(None, request, None).await
+    }
+
+    async fn connect_to(
+        &self,
+        gateway_base_url: &str,
+        request: AttestedConnectRequest,
+    ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
+        self.connect_inner(Some(gateway_base_url), request, None)
+            .await
+    }
+
+    async fn set_primary_gateway_url(&self, gateway_base_url: &str) {
+        self.set_gateway_base_url(gateway_base_url).await;
+    }
+
+    async fn disconnect(
+        &self,
+        session_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.disconnect_with_reason(session_id, AttestedDisconnectReason::Upgrade)
+            .await
+    }
+
+    async fn is_session_closed(&self, session_id: &str) -> bool {
+        match self.sessions.lock().await.get(session_id) {
+            Some(session) => session.transport().is_closed(),
+            None => true,
+        }
+    }
+
+    async fn teardown_for_reconnect(
+        &self,
+        session_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // TS reconnectSlot: gracefulDisconnect(..., "admin") then session.close().
+        match self
+            .disconnect_with_reason(session_id, AttestedDisconnectReason::Admin)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                // Transport may already be dead — drop map entry if still present.
+                if let Some(session) = self.sessions.lock().await.remove(session_id) {
+                    let _ = session.close().await;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn reconnect(
+        &self,
+        session_id: &str,
+        gateway_base_url: &str,
+        request: AttestedConnectRequest,
+    ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
+        // Ensure stale map entry is gone before re-inserting the same id.
+        if let Some(session) = self.sessions.lock().await.remove(session_id) {
+            let _ = session.close().await;
+        }
+        self.connect_inner(
+            Some(gateway_base_url),
+            request,
+            Some(session_id.to_string()),
+        )
+        .await
     }
 }

@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -9,17 +9,23 @@ use tracing::{info, warn};
 use ie_protocol::{AttestationBundle, AttestedConnectRequest};
 
 use crate::config::SupervisedPoolConfig;
-use crate::cutover::{plan_pool_drain, plan_pool_scale};
+use crate::cutover::{
+    map_with_concurrency, plan_pool_drain, plan_pool_scale, PoolConnectThrottle,
+    DEFAULT_POOL_CONNECT_CONCURRENCY, DEFAULT_POOL_CONNECT_STAGGER_MS,
+};
 use crate::error::EngineError;
 use crate::gateway_migration::plan_gateway_migration;
 use crate::pull_workers::{
-    warn_pull_worker_start, PullWorkerRegistry, PullWorkerStartFn, SessionsChangedFn,
+    warn_pull_worker_start, PullWorkerRegistry, PullWorkerStartFn, SessionReadyFn,
+    SessionsChangedFn,
 };
 use crate::traits::{ConnectResult, EnginePlaneConnector, InferenceUpstream, InferResult};
 
 /// Remint attestation before reconnect / scale / migrate (optional).
 pub type AttestationRefreshFn =
     Arc<dyn Fn() -> Result<AttestationBundle, String> + Send + Sync>;
+
+const SESSION_WATCH_INTERVAL_MS: u64 = 5_000;
 
 #[derive(Debug, Clone)]
 pub struct PoolSession {
@@ -30,6 +36,10 @@ pub struct PoolSession {
 struct SessionSlot {
     session: PoolSession,
     busy: AtomicBool,
+    reconnect_attempt: AtomicU32,
+    reconnect_pending: AtomicBool,
+    /// Set while draining / closing so close watch does not re-dial.
+    suppress_reconnect: AtomicBool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +75,8 @@ struct PoolState {
     slots: Vec<SessionSlot>,
     consecutive_failures: u32,
     circuit_open_until_ms: u64,
+    /// Sliding window of reconnect failure timestamps (TS poolReconnectFailureTimes).
+    reconnect_failure_times_ms: VecDeque<u64>,
 }
 
 impl Default for SessionSlot {
@@ -75,6 +87,9 @@ impl Default for SessionSlot {
                 gateway_base_url: String::new(),
             },
             busy: AtomicBool::new(false),
+            reconnect_attempt: AtomicU32::new(0),
+            reconnect_pending: AtomicBool::new(false),
+            suppress_reconnect: AtomicBool::new(false),
         }
     }
 }
@@ -92,7 +107,15 @@ pub struct SupervisedPool {
     workers: PullWorkerRegistry,
     /// Notify epoch rotator / ops when live session ids change.
     on_sessions_changed: RwLock<Option<SessionsChangedFn>>,
+    /// Post current epoch after connect / reconnect.
+    on_session_ready: RwLock<Option<SessionReadyFn>>,
+    closed: AtomicBool,
+    /// Suppress per-session epoch register during [`Self::boot`] (bulk register follows).
+    booting: AtomicBool,
+    /// Shared across boot / scale / migrate / reconnect (TS `connectThrottle`).
+    connect_throttle: Arc<PoolConnectThrottle>,
     state: RwLock<PoolState>,
+    watch_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
 }
 
 pub struct SupervisedPoolHandle {
@@ -115,13 +138,67 @@ impl SupervisedPool {
             attestation_refresh: RwLock::new(None),
             workers: PullWorkerRegistry::new(),
             on_sessions_changed: RwLock::new(None),
+            on_session_ready: RwLock::new(None),
+            closed: AtomicBool::new(false),
+            booting: AtomicBool::new(false),
+            connect_throttle: Arc::new(PoolConnectThrottle::new(
+                DEFAULT_POOL_CONNECT_CONCURRENCY,
+                DEFAULT_POOL_CONNECT_STAGGER_MS,
+            )),
             state: RwLock::new(PoolState::default()),
+            watch_task: RwLock::new(None),
         }
+    }
+
+    /// Replace connect throttle (call before boot; used by ie-bin from env).
+    pub fn with_connect_throttle(mut self, throttle: PoolConnectThrottle) -> Self {
+        self.connect_throttle = Arc::new(throttle);
+        self
+    }
+
+    pub fn connect_throttle(&self) -> &PoolConnectThrottle {
+        self.connect_throttle.as_ref()
     }
 
     /// Install / replace attestation remint used on scale + migrate (+ reconnect paths).
     pub async fn set_attestation_refresh(&self, refresh: Option<AttestationRefreshFn>) {
         *self.attestation_refresh.write().await = refresh;
+    }
+
+    async fn throttled_connect(
+        &self,
+        request: AttestedConnectRequest,
+    ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
+        let connector = Arc::clone(&self.connector);
+        self.connect_throttle
+            .run(move || async move { connector.connect(request).await })
+            .await
+    }
+
+    async fn throttled_connect_to(
+        &self,
+        gateway_base_url: &str,
+        request: AttestedConnectRequest,
+    ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
+        let connector = Arc::clone(&self.connector);
+        let url = gateway_base_url.to_string();
+        self.connect_throttle
+            .run(move || async move { connector.connect_to(&url, request).await })
+            .await
+    }
+
+    async fn throttled_reconnect(
+        &self,
+        session_id: &str,
+        gateway_base_url: &str,
+        request: AttestedConnectRequest,
+    ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
+        let connector = Arc::clone(&self.connector);
+        let session_id = session_id.to_string();
+        let url = gateway_base_url.to_string();
+        self.connect_throttle
+            .run(move || async move { connector.reconnect(&session_id, &url, request).await })
+            .await
     }
 
     /// Register pull-worker factory (required for live H2; unit tests leave unset).
@@ -133,8 +210,238 @@ impl SupervisedPool {
         *self.on_sessions_changed.write().await = cb;
     }
 
+    pub async fn set_on_session_ready(&self, cb: Option<SessionReadyFn>) {
+        *self.on_session_ready.write().await = cb;
+    }
+
     pub fn workers(&self) -> &PullWorkerRegistry {
         &self.workers
+    }
+
+    /// Start the 5s closed-transport watch (TS `sessionWatchTimer`).
+    pub async fn start_session_watch(self: &Arc<Self>) {
+        if self.watch_task.read().await.is_some() {
+            return;
+        }
+        let pool = Arc::clone(self);
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(SESSION_WATCH_INTERVAL_MS)).await;
+                if pool.closed.load(Ordering::SeqCst) {
+                    break;
+                }
+                let ids = pool.session_ids().await;
+                for sid in ids {
+                    if pool.connector.is_session_closed(&sid).await {
+                        pool.schedule_reconnect(sid);
+                    }
+                }
+            }
+        });
+        *self.watch_task.write().await = Some(handle);
+    }
+
+    /// Pull-worker / transport path entry (TS `bindSessionClose` → `scheduleReconnect`).
+    pub fn notify_transport_lost(self: &Arc<Self>, session_id: impl Into<String>) {
+        self.schedule_reconnect(session_id.into());
+    }
+
+    fn reconnect_delay_ms(&self, attempt: u32) -> u64 {
+        let base = self.config.reconnect.reconnect_base_ms.max(1);
+        let max = self.config.reconnect.reconnect_max_ms.max(base);
+        let shift = attempt.min(5);
+        base.saturating_mul(1u64 << shift).min(max)
+    }
+
+    async fn circuit_delay_ms(&self) -> u64 {
+        let until = self.state.read().await.circuit_open_until_ms;
+        until.saturating_sub(now_ms())
+    }
+
+    async fn record_reconnect_failure(&self) {
+        let now = now_ms();
+        let window = self.config.reconnect.fail_window_ms;
+        let threshold = self.config.reconnect.fail_threshold;
+        let circuit_ms = self.config.reconnect.circuit_ms;
+        let mut state = self.state.write().await;
+        while state
+            .reconnect_failure_times_ms
+            .front()
+            .is_some_and(|t| now.saturating_sub(*t) > window)
+        {
+            state.reconnect_failure_times_ms.pop_front();
+        }
+        state.reconnect_failure_times_ms.push_back(now);
+        if state.reconnect_failure_times_ms.len() as u32 >= threshold {
+            state.circuit_open_until_ms = now + circuit_ms;
+            state.reconnect_failure_times_ms.clear();
+            warn!(
+                circuit_ms,
+                "pool reconnect circuit opened (failure window)"
+            );
+        }
+    }
+
+    async fn clear_reconnect_circuit(&self) {
+        let mut state = self.state.write().await;
+        state.reconnect_failure_times_ms.clear();
+        state.circuit_open_until_ms = 0;
+        state.consecutive_failures = 0;
+    }
+
+    fn schedule_reconnect(self: &Arc<Self>, session_id: String) {
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let pool = Arc::clone(self);
+        tokio::spawn(async move {
+            let attempt = {
+                let state = pool.state.read().await;
+                let Some(slot) = state
+                    .slots
+                    .iter()
+                    .find(|s| s.session.session_id == session_id)
+                else {
+                    return;
+                };
+                if slot.suppress_reconnect.load(Ordering::SeqCst) {
+                    return;
+                }
+                if slot
+                    .reconnect_pending
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    return;
+                }
+                slot.reconnect_attempt.load(Ordering::SeqCst)
+            };
+            let delay = pool
+                .reconnect_delay_ms(attempt)
+                .max(pool.circuit_delay_ms().await);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            pool.reconnect_slot(&session_id).await;
+        });
+    }
+
+    async fn reconnect_slot(self: &Arc<Self>, session_id: &str) {
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let (gateway_url, attempt) = {
+            let state = self.state.read().await;
+            let Some(slot) = state
+                .slots
+                .iter()
+                .find(|s| s.session.session_id == session_id)
+            else {
+                return;
+            };
+            if slot.suppress_reconnect.load(Ordering::SeqCst) {
+                slot.reconnect_pending.store(false, Ordering::SeqCst);
+                return;
+            }
+            let attempt = slot.reconnect_attempt.fetch_add(1, Ordering::SeqCst) + 1;
+            (slot.session.gateway_base_url.clone(), attempt)
+        };
+
+        self.workers.stop_session(session_id).await;
+        let _ = self.connector.teardown_for_reconnect(session_id).await;
+
+        let template = match self.connect_template().await {
+            Some(t) => t,
+            None => {
+                warn!(session_id, "reconnect aborted: no connect template");
+                self.record_reconnect_failure().await;
+                self.clear_reconnect_pending(session_id).await;
+                self.schedule_reconnect(session_id.to_string());
+                return;
+            }
+        };
+
+        let mut request = match self.apply_fresh_attestation(template).await {
+            Ok(r) => r,
+            Err(err) => {
+                warn!(session_id, error = %err, "reconnect attestation refresh failed");
+                self.record_reconnect_failure().await;
+                self.clear_reconnect_pending(session_id).await;
+                self.schedule_reconnect(session_id.to_string());
+                return;
+            }
+        };
+        request.session_id = session_id.to_string();
+
+        match self
+            .throttled_reconnect(session_id, &gateway_url, request)
+            .await
+        {
+            Ok(result) => {
+                if result.session_id != session_id {
+                    warn!(
+                        expected = session_id,
+                        got = %result.session_id,
+                        "reconnect returned different session id"
+                    );
+                }
+                {
+                    let state = self.state.read().await;
+                    if let Some(slot) = state
+                        .slots
+                        .iter()
+                        .find(|s| s.session.session_id == session_id)
+                    {
+                        slot.reconnect_attempt.store(0, Ordering::SeqCst);
+                        slot.busy.store(false, Ordering::SeqCst);
+                    }
+                }
+                if let Err(err) = self.invoke_session_ready(session_id).await {
+                    warn!(session_id, error = %err, "reconnect epoch register failed");
+                }
+                if let Err(err) = self.workers.ensure_started(session_id).await {
+                    warn_pull_worker_start(session_id, &err);
+                }
+                self.clear_reconnect_circuit().await;
+                self.clear_reconnect_pending(session_id).await;
+                info!(session_id, attempt, "engine session reconnected");
+            }
+            Err(err) => {
+                warn!(session_id, attempt, error = %err, "engine session reconnect failed");
+                self.record_reconnect_failure().await;
+                self.clear_reconnect_pending(session_id).await;
+                self.schedule_reconnect(session_id.to_string());
+            }
+        }
+    }
+
+    async fn clear_reconnect_pending(&self, session_id: &str) {
+        let state = self.state.read().await;
+        if let Some(slot) = state
+            .slots
+            .iter()
+            .find(|s| s.session.session_id == session_id)
+        {
+            slot.reconnect_pending.store(false, Ordering::SeqCst);
+        }
+    }
+
+    async fn invoke_session_ready(&self, session_id: &str) -> Result<(), String> {
+        let ready = self.on_session_ready.read().await.clone();
+        if let Some(ready) = ready {
+            ready(session_id.to_string()).await?;
+        }
+        Ok(())
+    }
+
+    async fn suppress_reconnect(&self, session_id: &str) {
+        let state = self.state.read().await;
+        if let Some(slot) = state
+            .slots
+            .iter()
+            .find(|s| s.session.session_id == session_id)
+        {
+            slot.suppress_reconnect.store(true, Ordering::SeqCst);
+            slot.reconnect_pending.store(false, Ordering::SeqCst);
+        }
     }
 
     async fn notify_sessions_changed(&self) {
@@ -199,7 +506,10 @@ impl SupervisedPool {
         SupervisedPoolHandle { pool: self }
     }
 
-    pub async fn boot(&self, mut connect_request: AttestedConnectRequest) -> Result<(), EngineError> {
+    pub async fn boot(
+        self: &Arc<Self>,
+        mut connect_request: AttestedConnectRequest,
+    ) -> Result<(), EngineError> {
         connect_request.pool_target_size = Some(self.config.pool_target_size);
         *self.connect_template.write().await = Some(connect_request.clone());
         let target = if self.config.supervised {
@@ -209,14 +519,27 @@ impl SupervisedPool {
         };
 
         let gateway = self.gateway_base_url.read().await.clone();
+        let concurrency = self.connect_throttle.concurrency().min(target.max(1));
         info!(
             target,
+            concurrency,
+            stagger_ms = self.connect_throttle.stagger_ms(),
             gateway = %gateway,
             "supervised pool boot"
         );
 
-        for _ in 0..target {
-            self.connect_one(connect_request.clone()).await?;
+        self.booting.store(true, Ordering::SeqCst);
+        let pool = Arc::clone(self);
+        let req = connect_request;
+        let results = map_with_concurrency(target, concurrency, move |_| {
+            let pool = Arc::clone(&pool);
+            let req = req.clone();
+            async move { pool.connect_one(req).await }
+        })
+        .await;
+        self.booting.store(false, Ordering::SeqCst);
+        for result in results {
+            result?;
         }
         Ok(())
     }
@@ -233,7 +556,7 @@ impl SupervisedPool {
         let request = self.apply_fresh_attestation(request).await?;
         *self.connect_template.write().await = Some(request.clone());
         let gateway = self.gateway_base_url.read().await.clone();
-        match self.connector.connect(request).await {
+        match self.throttled_connect(request).await {
             Ok(result) => {
                 self.state.write().await.consecutive_failures = 0;
                 self.state.write().await.slots.push(SessionSlot {
@@ -241,8 +564,18 @@ impl SupervisedPool {
                         session_id: result.session_id.clone(),
                         gateway_base_url: gateway,
                     },
-                    busy: AtomicBool::new(false),
+                    ..SessionSlot::default()
                 });
+                // Boot uses bulk `register_initial_epoch`; scale/reconnect register per session.
+                if !self.booting.load(Ordering::SeqCst) {
+                    if let Err(err) = self.invoke_session_ready(&result.session_id).await {
+                        warn!(
+                            session_id = %result.session_id,
+                            error = %err,
+                            "session ready (epoch) failed"
+                        );
+                    }
+                }
                 if let Err(err) = self.workers.ensure_started(&result.session_id).await {
                     warn_pull_worker_start(&result.session_id, &err);
                 }
@@ -323,7 +656,7 @@ impl SupervisedPool {
     }
 
     pub async fn scale_to(
-        &self,
+        self: &Arc<Self>,
         target_size: u32,
         connect_request: AttestedConnectRequest,
     ) -> Result<u32, EngineError> {
@@ -331,13 +664,21 @@ impl SupervisedPool {
         if plan.blocked {
             return Err(EngineError::Scale(plan.reason.unwrap_or_default()));
         }
+        let to_add = plan.added;
+        if to_add == 0 {
+            return Ok(0);
+        }
+        let concurrency = self.connect_throttle.concurrency().min(to_add);
+        let pool = Arc::clone(self);
+        let results = map_with_concurrency(to_add, concurrency, move |_| {
+            let pool = Arc::clone(&pool);
+            let req = connect_request.clone();
+            async move { pool.connect_one(req).await }
+        })
+        .await;
         let mut added = 0u32;
-        let current = self.live_session_count().await;
-        for _ in current..target_size.min(self.config.pool_target_size.max(target_size)) {
-            if self.live_session_count().await >= target_size {
-                break;
-            }
-            self.connect_one(connect_request.clone()).await?;
+        for result in results {
+            result?;
             added += 1;
         }
         Ok(added)
@@ -395,6 +736,7 @@ impl SupervisedPool {
             if self.session_is_busy(&session_id).await {
                 continue;
             }
+            self.suppress_reconnect(&session_id).await;
             self.workers.stop_session(&session_id).await;
             if let Err(err) = self.connector.disconnect(&session_id).await {
                 warn!(session_id = %session_id, error = %err, "disconnect failed during drain");
@@ -431,6 +773,12 @@ impl SupervisedPool {
         if normalized.is_empty() {
             return Err(EngineError::Connect("empty migration target_url".into()));
         }
+
+        // Sticky primary: reconnect/scale must dial the migration target (TS sets at start).
+        *self.gateway_base_url.write().await = normalized.clone();
+        self.connector
+            .set_primary_gateway_url(&normalized)
+            .await;
 
         let template = self.connect_template.read().await.clone().ok_or_else(|| {
             EngineError::Connect("no connect template; boot the pool first".into())
@@ -493,7 +841,7 @@ impl SupervisedPool {
             let req = self.apply_fresh_attestation(req).await?;
             *self.connect_template.write().await = Some(req.clone());
 
-            let new_conn = match self.connector.connect_to(&normalized, req).await {
+            let new_conn = match self.throttled_connect_to(&normalized, req).await {
                 Ok(r) => r,
                 Err(err) => {
                     warn!(error = %err, target = %normalized, "migrate connect_to failed");
@@ -503,6 +851,7 @@ impl SupervisedPool {
             let new_session_id = new_conn.session_id.clone();
 
             // Stop source puller before disconnect (TS migrateOneSession).
+            self.suppress_reconnect(&old_session_id).await;
             self.workers.stop_session(&old_session_id).await;
             if let Err(err) = self.connector.disconnect(&old_session_id).await {
                 warn!(
@@ -518,6 +867,9 @@ impl SupervisedPool {
                     slot.session.session_id = new_session_id.clone();
                     slot.session.gateway_base_url = normalized.clone();
                     slot.busy.store(false, Ordering::SeqCst);
+                    slot.suppress_reconnect.store(false, Ordering::SeqCst);
+                    slot.reconnect_pending.store(false, Ordering::SeqCst);
+                    slot.reconnect_attempt.store(0, Ordering::SeqCst);
                     moved += 1;
                 } else {
                     state.slots.push(SessionSlot {
@@ -525,20 +877,26 @@ impl SupervisedPool {
                             session_id: new_session_id.clone(),
                             gateway_base_url: normalized.clone(),
                         },
-                        busy: AtomicBool::new(false),
+                        ..SessionSlot::default()
                     });
                     moved += 1;
                 }
             }
             drop(state);
 
+            if let Err(err) = self.invoke_session_ready(&new_session_id).await {
+                warn!(
+                    session_id = %new_session_id,
+                    error = %err,
+                    "migrate session ready (epoch) failed"
+                );
+            }
             if let Err(err) = self.workers.ensure_started(&new_session_id).await {
                 warn_pull_worker_start(&new_session_id, &err);
             }
         }
 
         if moved > 0 {
-            *self.gateway_base_url.write().await = normalized.clone();
             self.notify_sessions_changed().await;
         }
 
@@ -561,8 +919,13 @@ impl SupervisedPool {
     }
 
     pub async fn close_all(&self) -> Result<(), EngineError> {
+        self.closed.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.watch_task.write().await.take() {
+            handle.abort();
+        }
         let ids: Vec<String> = self.session_ids().await;
         for id in ids {
+            self.suppress_reconnect(&id).await;
             self.workers.stop_session(&id).await;
             if let Err(err) = self.connector.disconnect(&id).await {
                 warn!(session_id = %id, error = %err, "disconnect failed during pool close");
@@ -712,21 +1075,32 @@ mod tests {
         }
     }
 
+    fn test_pool(
+        config: SupervisedPoolConfig,
+        gateway: &str,
+        connector: Arc<dyn EnginePlaneConnector>,
+    ) -> Arc<SupervisedPool> {
+        Arc::new(
+            SupervisedPool::new(config, gateway, connector, Arc::new(MockUpstream))
+                // Fast tests: no stagger between dials.
+                .with_connect_throttle(PoolConnectThrottle::new(8, 0)),
+        )
+    }
+
     #[tokio::test]
     async fn boots_initial_fraction() {
-        let pool = Arc::new(SupervisedPool::new(
+        let pool = test_pool(
             pool_cfg(),
             "https://gateway.example",
             Arc::new(MockConnector),
-            Arc::new(MockUpstream),
-        ));
+        );
         pool.boot(sample_request()).await.unwrap();
         assert_eq!(pool.session_ids().await.len(), 2);
     }
 
     #[tokio::test]
     async fn drain_idle_pool_half() {
-        let pool = Arc::new(SupervisedPool::new(
+        let pool = test_pool(
             SupervisedPoolConfig {
                 pool_target_size: 2,
                 pool_initial_fraction: 1.0,
@@ -737,8 +1111,7 @@ mod tests {
             },
             "https://gateway.example",
             Arc::new(MockConnector),
-            Arc::new(MockUpstream),
-        ));
+        );
         pool.boot(sample_request()).await.unwrap();
         let result = pool.drain_idle_pool(0.5).await.unwrap();
         assert_eq!(result.drained, 1);
@@ -747,7 +1120,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_skips_busy_sessions() {
-        let pool = Arc::new(SupervisedPool::new(
+        let pool = test_pool(
             SupervisedPoolConfig {
                 pool_target_size: 2,
                 pool_initial_fraction: 1.0,
@@ -758,8 +1131,7 @@ mod tests {
             },
             "https://gateway.example",
             Arc::new(MockConnector),
-            Arc::new(MockUpstream),
-        ));
+        );
         pool.boot(sample_request()).await.unwrap();
         let ids = pool.session_ids().await;
         assert_eq!(ids.len(), 2);
@@ -772,7 +1144,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_gateway_pool_moves_idle_sessions() {
-        let pool = Arc::new(SupervisedPool::new(
+        let pool = test_pool(
             SupervisedPoolConfig {
                 pool_target_size: 4,
                 pool_initial_fraction: 1.0,
@@ -783,8 +1155,7 @@ mod tests {
             },
             "https://gateway-old",
             Arc::new(MockConnector),
-            Arc::new(MockUpstream),
-        ));
+        );
         pool.boot({
             let mut r1 = sample_request();
             r1.session_id = "boot-1".into();
@@ -798,7 +1169,235 @@ mod tests {
             .await
             .unwrap();
         assert!(result.moved >= 1);
+        assert_eq!(pool.gateway_base_url().await, "https://gateway-new");
         let counts = pool.sessions_by_gateway_url().await;
         assert!(counts.get("https://gateway-new").copied().unwrap_or(0) >= 1);
+    }
+
+    struct StickyMock {
+        primary: tokio::sync::Mutex<String>,
+        inner: MockConnector,
+    }
+
+    impl StickyMock {
+        fn new(primary: &str) -> Self {
+            Self {
+                primary: tokio::sync::Mutex::new(primary.to_string()),
+                inner: MockConnector,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EnginePlaneConnector for StickyMock {
+        async fn connect(
+            &self,
+            request: AttestedConnectRequest,
+        ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
+            self.inner.connect(request).await
+        }
+
+        async fn disconnect(
+            &self,
+            session_id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.inner.disconnect(session_id).await
+        }
+
+        async fn set_primary_gateway_url(&self, gateway_base_url: &str) {
+            *self.primary.lock().await = gateway_base_url.to_string();
+        }
+    }
+
+    #[tokio::test]
+    async fn migrate_sets_sticky_primary_even_when_zero_moves() {
+        let connector = Arc::new(StickyMock::new("https://gateway-old"));
+        let pool = test_pool(
+            SupervisedPoolConfig {
+                pool_target_size: 1,
+                pool_initial_fraction: 1.0,
+                pool_initial_fraction_explicit: true,
+                pool_baseline: 1,
+                supervised: true,
+                reconnect: PoolReconnectConfig::default(),
+            },
+            "https://gateway-old",
+            connector.clone() as Arc<dyn EnginePlaneConnector>,
+        );
+        let mut req = sample_request();
+        req.session_id = "busy-1".into();
+        pool.boot(req).await.unwrap();
+        let ids = pool.session_ids().await;
+        pool.set_session_busy(&ids[0], true).await;
+        let result = pool
+            .migrate_gateway_pool("https://gateway-new", 1.0)
+            .await
+            .unwrap();
+        assert_eq!(result.moved, 0);
+        assert_eq!(pool.gateway_base_url().await, "https://gateway-new");
+        assert_eq!(
+            connector.primary.lock().await.as_str(),
+            "https://gateway-new"
+        );
+    }
+
+    struct ReconnectMock {
+        live: tokio::sync::Mutex<HashMap<String, bool>>,
+        reconnects: AtomicU32,
+        teardowns: AtomicU32,
+    }
+
+    impl ReconnectMock {
+        fn new() -> Self {
+            Self {
+                live: tokio::sync::Mutex::new(HashMap::new()),
+                reconnects: AtomicU32::new(0),
+                teardowns: AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EnginePlaneConnector for ReconnectMock {
+        async fn connect(
+            &self,
+            request: AttestedConnectRequest,
+        ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
+            let sid = if request.session_id.is_empty() {
+                format!("sess-{}", NEXT_ID.fetch_add(1, Ordering::SeqCst))
+            } else {
+                request.session_id
+            };
+            self.live.lock().await.insert(sid.clone(), true);
+            Ok(ConnectResult {
+                session_id: sid,
+                response: AttestedConnectResponse {
+                    ok: true,
+                    gateway_attestation: None,
+                    pool_target_ack: Some(1),
+                    gateway_challenge_nonce: None,
+                },
+            })
+        }
+
+        async fn disconnect(
+            &self,
+            session_id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.live.lock().await.remove(session_id);
+            Ok(())
+        }
+
+        async fn is_session_closed(&self, session_id: &str) -> bool {
+            !self.live.lock().await.get(session_id).copied().unwrap_or(false)
+        }
+
+        async fn teardown_for_reconnect(
+            &self,
+            session_id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.teardowns.fetch_add(1, Ordering::SeqCst);
+            self.live.lock().await.insert(session_id.to_string(), false);
+            Ok(())
+        }
+
+        async fn reconnect(
+            &self,
+            session_id: &str,
+            _gateway_base_url: &str,
+            _request: AttestedConnectRequest,
+        ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
+            self.reconnects.fetch_add(1, Ordering::SeqCst);
+            self.live.lock().await.insert(session_id.to_string(), true);
+            Ok(ConnectResult {
+                session_id: session_id.to_string(),
+                response: AttestedConnectResponse {
+                    ok: true,
+                    gateway_attestation: None,
+                    pool_target_ack: Some(1),
+                    gateway_challenge_nonce: None,
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_keeps_session_id() {
+        let connector = Arc::new(ReconnectMock::new());
+        let pool = test_pool(
+            SupervisedPoolConfig {
+                pool_target_size: 1,
+                pool_initial_fraction: 1.0,
+                pool_initial_fraction_explicit: true,
+                pool_baseline: 1,
+                supervised: true,
+                reconnect: PoolReconnectConfig {
+                    fail_threshold: 8,
+                    fail_window_ms: 10_000,
+                    circuit_ms: 30_000,
+                    reconnect_base_ms: 10,
+                    reconnect_max_ms: 50,
+                },
+            },
+            "https://gateway.example",
+            connector.clone() as Arc<dyn EnginePlaneConnector>,
+        );
+        let mut req = sample_request();
+        req.session_id = "sticky-1".into();
+        pool.boot(req).await.unwrap();
+        let ids = pool.session_ids().await;
+        assert_eq!(ids, vec!["sticky-1".to_string()]);
+
+        // Simulate transport death.
+        connector.live.lock().await.insert("sticky-1".into(), false);
+        pool.notify_transport_lost("sticky-1");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while connector.reconnects.load(Ordering::SeqCst) == 0 {
+            if tokio::time::Instant::now() > deadline {
+                panic!("timed out waiting for reconnect");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(pool.session_ids().await, vec!["sticky-1".to_string()]);
+        assert!(connector.teardowns.load(Ordering::SeqCst) >= 1);
+        assert!(connector
+            .live
+            .lock()
+            .await
+            .get("sticky-1")
+            .copied()
+            .unwrap_or(false));
+        pool.close_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_suppresses_reconnect() {
+        let connector = Arc::new(ReconnectMock::new());
+        let pool = test_pool(
+            SupervisedPoolConfig {
+                pool_target_size: 1,
+                pool_initial_fraction: 1.0,
+                pool_initial_fraction_explicit: true,
+                pool_baseline: 1,
+                supervised: true,
+                reconnect: PoolReconnectConfig {
+                    reconnect_base_ms: 10,
+                    reconnect_max_ms: 20,
+                    ..PoolReconnectConfig::default()
+                },
+            },
+            "https://gateway.example",
+            connector.clone() as Arc<dyn EnginePlaneConnector>,
+        );
+        let mut req = sample_request();
+        req.session_id = "drain-1".into();
+        pool.boot(req).await.unwrap();
+        pool.drain_idle_sessions(1).await.unwrap();
+        pool.notify_transport_lost("drain-1");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(connector.reconnects.load(Ordering::SeqCst), 0);
+        assert!(pool.session_ids().await.is_empty());
     }
 }

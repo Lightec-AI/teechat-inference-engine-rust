@@ -34,10 +34,42 @@ pub trait EnginePlaneConnector: Send + Sync {
         self.connect(request).await
     }
 
+    /// Sticky primary dial URL after gateway migrate (TS `primaryGatewayUrl`).
+    ///
+    /// Subsequent [`Self::connect`] / scale must use this URL. Default: no-op.
+    async fn set_primary_gateway_url(&self, _gateway_base_url: &str) {}
+
     async fn disconnect(
         &self,
         session_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// True when the live H2 transport for `session_id` is gone (or unknown).
+    async fn is_session_closed(&self, _session_id: &str) -> bool {
+        false
+    }
+
+    /// Best-effort graceful teardown before re-dial (TS reconnect uses reason `admin`).
+    ///
+    /// Default: [`Self::disconnect`]. Errors are ignored by the pool reconnect path.
+    async fn teardown_for_reconnect(
+        &self,
+        session_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.disconnect(session_id).await
+    }
+
+    /// Re-dial keeping the same `session_id` (TS reconnect affinity).
+    async fn reconnect(
+        &self,
+        session_id: &str,
+        gateway_base_url: &str,
+        request: AttestedConnectRequest,
+    ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
+        let mut request = request;
+        request.session_id = session_id.to_string();
+        self.connect_to(gateway_base_url, request).await
+    }
 }
 
 /// vLLM / OpenAI-compatible inference upstream (port of `upstream/vllm-chat.ts` usage site).

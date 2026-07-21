@@ -73,6 +73,7 @@ pub use pool::{
     PoolDrainResult, PoolScaleResult, PoolSession, SupervisedPool, SupervisedPoolHandle,
 };
 pub use pull_workers::{
-    PullWorkerRegistry, PullWorkerStartFn, PullWorkerStartFuture, SessionsChangedFn,
+    PullWorkerRegistry, PullWorkerStartFn, PullWorkerStartFuture, SessionReadyFn, SessionReadyFuture,
+    SessionsChangedFn, TransportLostFn,
 };
 pub use traits::{ConnectResult, EnginePlaneConnector, InferResult, InferenceUpstream};

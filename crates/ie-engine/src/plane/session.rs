@@ -71,6 +71,11 @@ impl StreamingPostHandle {
 /// Abstract long-lived engine-plane session transport (one HTTP/2 connection).
 #[async_trait]
 pub trait PlaneTransport: Send + Sync {
+    /// True when the underlying H2 connection is gone (TS `session.closed || destroyed`).
+    fn is_closed(&self) -> bool {
+        false
+    }
+
     async fn request_json(
         &self,
         method: &str,

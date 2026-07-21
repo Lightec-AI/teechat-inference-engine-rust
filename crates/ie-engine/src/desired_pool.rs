@@ -38,7 +38,7 @@ pub fn clamp_desired_pool_target(raw: u32, baseline: u32, max: u32) -> u32 {
 
 /// Apply a gateway desired target once (no debounce).
 pub async fn apply_desired_pool_target(
-    pool: &SupervisedPool,
+    pool: &Arc<SupervisedPool>,
     config: &SupervisedPoolConfig,
     raw_desired: u32,
 ) -> Result<(), EngineError> {
@@ -85,7 +85,7 @@ pub fn spawn_desired_pool_applier(
             while let Ok(more) = rx.try_recv() {
                 pending = more;
             }
-            if let Err(err) = apply_desired_pool_target(pool.as_ref(), &config, pending).await {
+            if let Err(err) = apply_desired_pool_target(&pool, &config, pending).await {
                 warn!(error = %err, desired = pending, "desired pool apply failed");
             }
         }

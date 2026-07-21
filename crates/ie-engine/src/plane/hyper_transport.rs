@@ -1,5 +1,6 @@
 //! Real HTTP/2 + rustls dialer for the engine plane.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -35,6 +36,13 @@ fn full_bytes(payload: Bytes) -> ReqBody {
 pub struct HyperPlaneTransport {
     sender: Mutex<SendRequest>,
     authority: String,
+    closed: Arc<AtomicBool>,
+}
+
+impl HyperPlaneTransport {
+    fn mark_closed(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
 }
 
 impl HyperPlaneTransport {
@@ -67,17 +75,27 @@ impl HyperPlaneTransport {
         // concurrent ephemeral POSTs can multiplex on the same H2 connection.
         let response = {
             let mut sender = self.sender.lock().await;
-            sender
-                .send_request(req)
-                .await
-                .map_err(|e| PlaneError::H2(format!("send_request: {e:?}")))?
+            if sender.is_closed() {
+                self.mark_closed();
+                return Err(PlaneError::H2("h2 connection closed".into()));
+            }
+            match sender.send_request(req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    self.mark_closed();
+                    return Err(PlaneError::H2(format!("send_request: {e:?}")));
+                }
+            }
         };
         let status = response.status().as_u16();
         let collected = response
             .into_body()
             .collect()
             .await
-            .map_err(|e| PlaneError::H2(format!("body: {e:?}")))?;
+            .map_err(|e| {
+                self.mark_closed();
+                PlaneError::H2(format!("body: {e:?}"))
+            })?;
         let bytes = collected.to_bytes();
         let json = if bytes.is_empty() {
             Value::Null
@@ -116,10 +134,17 @@ impl HyperPlaneTransport {
 
         let response = {
             let mut sender = self.sender.lock().await;
-            sender
-                .send_request(req)
-                .await
-                .map_err(|e| PlaneError::H2(format!("send_request: {e:?}")))?
+            if sender.is_closed() {
+                self.mark_closed();
+                return Err(PlaneError::H2("h2 connection closed".into()));
+            }
+            match sender.send_request(req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    self.mark_closed();
+                    return Err(PlaneError::H2(format!("send_request: {e:?}")));
+                }
+            }
         };
         let status = response.status().as_u16();
         let mut headers_out = Vec::new();
@@ -132,7 +157,10 @@ impl HyperPlaneTransport {
             .into_body()
             .collect()
             .await
-            .map_err(|e| PlaneError::H2(format!("body: {e:?}")))?;
+            .map_err(|e| {
+                self.mark_closed();
+                PlaneError::H2(format!("body: {e:?}"))
+            })?;
         Ok(H2BytesResponse {
             status,
             headers: headers_out,
@@ -201,6 +229,16 @@ impl HyperPlaneTransport {
 
 #[async_trait]
 impl PlaneTransport for HyperPlaneTransport {
+    fn is_closed(&self) -> bool {
+        if self.closed.load(Ordering::SeqCst) {
+            return true;
+        }
+        self.sender
+            .try_lock()
+            .map(|s| s.is_closed())
+            .unwrap_or(false)
+    }
+
     async fn request_json(
         &self,
         method: &str,
@@ -233,6 +271,7 @@ impl PlaneTransport for HyperPlaneTransport {
     }
 
     async fn close(&self) -> Result<(), PlaneError> {
+        self.mark_closed();
         Ok(())
     }
 }
@@ -278,10 +317,13 @@ pub async fn dial_hyper_transport(
         .await
         .map_err(|e| PlaneError::H2(format!("{e:?}")))?;
 
+    let closed = Arc::new(AtomicBool::new(false));
+    let closed_watch = Arc::clone(&closed);
     tokio::spawn(async move {
         if let Err(err) = conn.await {
             tracing::warn!(error = %err, "engine-plane h2 connection closed");
         }
+        closed_watch.store(true, Ordering::SeqCst);
     });
 
     let authority = if port == 443 {
@@ -292,6 +334,7 @@ pub async fn dial_hyper_transport(
     Ok(Box::new(HyperPlaneTransport {
         sender: Mutex::new(sender),
         authority,
+        closed,
     }))
 }
 

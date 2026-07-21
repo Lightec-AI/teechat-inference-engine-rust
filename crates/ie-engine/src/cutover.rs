@@ -284,6 +284,7 @@ pub fn pool_connect_stagger_ms_from_env(env: &HashMap<String, String>) -> u64 {
 }
 
 pub struct PoolConnectThrottle {
+    concurrency: u32,
     semaphore: Arc<Semaphore>,
     stagger_ms: u64,
     next_start: tokio::sync::Mutex<Instant>,
@@ -291,11 +292,21 @@ pub struct PoolConnectThrottle {
 
 impl PoolConnectThrottle {
     pub fn new(concurrency: u32, stagger_ms: u64) -> Self {
+        let concurrency = concurrency.max(1);
         Self {
-            semaphore: Arc::new(Semaphore::new(concurrency.max(1) as usize)),
+            concurrency,
+            semaphore: Arc::new(Semaphore::new(concurrency as usize)),
             stagger_ms,
             next_start: tokio::sync::Mutex::new(Instant::now()),
         }
+    }
+
+    pub fn concurrency(&self) -> u32 {
+        self.concurrency
+    }
+
+    pub fn stagger_ms(&self) -> u64 {
+        self.stagger_ms
     }
 
     pub async fn run<F, Fut, T>(&self, f: F) -> T

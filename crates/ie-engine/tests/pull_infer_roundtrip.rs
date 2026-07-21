@@ -226,7 +226,7 @@ async fn mock_gateway_assign_work_decrypt_vllm_encrypt_result() {
         usage_signing_key: None,
     };
 
-    let worker = start_pull_worker(gateway.clone(), "sess-1".into(), inference, None);
+    let worker = start_pull_worker(gateway.clone(), "sess-1".into(), inference, None, None);
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
