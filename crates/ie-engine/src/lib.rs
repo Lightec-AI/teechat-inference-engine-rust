@@ -74,6 +74,6 @@ pub use pool::{
 };
 pub use pull_workers::{
     PullWorkerRegistry, PullWorkerStartFn, PullWorkerStartFuture, SessionReadyFn, SessionReadyFuture,
-    SessionsChangedFn, TransportLostFn,
+    SessionsChangedFn, TransportLostFn, warn_pull_worker_start,
 };
 pub use traits::{ConnectResult, EnginePlaneConnector, InferResult, InferenceUpstream};

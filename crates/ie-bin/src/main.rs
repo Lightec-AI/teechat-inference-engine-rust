@@ -15,6 +15,7 @@ use ie_engine::{
     configure_event_log_from_env, create_pool_connect_throttle_from_env, engine_instance_id_from_env,
     epoch_rotation_policy_from_env, generate_gateway_connect_challenge_nonce, install_engine_controls,
     platform_policy_verifier_from_env, spawn_desired_pool_applier, start_pull_worker,
+    warn_pull_worker_start,
     DesiredPoolTargetCallback, EnginePlaneDialOptions, EphemeralPoster, EpochRotatedCallback,
     EpochRotator, EpochRotatorSession, Http2EnginePlaneConnector, OpeInferenceOptions,
     PullWorkerStartFn, RotatingEpochDecryptor, SupervisedPool, SupervisedPoolConfig,
@@ -560,6 +561,14 @@ async fn run_engine(
         // Zero-boot staging has no sessions yet — epoch lands on first scale (TS parity).
         if pool.live_session_count().await > 0 {
             rotator.register_initial_epoch().await?;
+            // TS parity: start pull workers AFTER bulk epoch registration so the
+            // long-poll never contends with the ephemeral epoch POST on the same H2 stream
+            // (boot's `attachSlotCore` connects only; epoch registers, then pull workers start).
+            for sid in pool.session_ids().await {
+                if let Err(err) = pool.workers().ensure_started(&sid).await {
+                    warn_pull_worker_start(&sid, &err);
+                }
+            }
         }
         rotator.start().await;
         pool.start_session_watch().await;

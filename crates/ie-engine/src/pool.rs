@@ -567,6 +567,9 @@ impl SupervisedPool {
                     ..SessionSlot::default()
                 });
                 // Boot uses bulk `register_initial_epoch`; scale/reconnect register per session.
+                // Pull workers also wait until after boot's bulk epoch register (TS parity:
+                // `attachSlotCore` connects only; boot registers epoch, then starts pull workers)
+                // so the long-poll never contends with the ephemeral epoch POST.
                 if !self.booting.load(Ordering::SeqCst) {
                     if let Err(err) = self.invoke_session_ready(&result.session_id).await {
                         warn!(
@@ -575,9 +578,9 @@ impl SupervisedPool {
                             "session ready (epoch) failed"
                         );
                     }
-                }
-                if let Err(err) = self.workers.ensure_started(&result.session_id).await {
-                    warn_pull_worker_start(&result.session_id, &err);
+                    if let Err(err) = self.workers.ensure_started(&result.session_id).await {
+                        warn_pull_worker_start(&result.session_id, &err);
+                    }
                 }
                 self.notify_sessions_changed().await;
                 Ok(result)
