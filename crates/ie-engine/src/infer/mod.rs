@@ -10,5 +10,6 @@ pub use gate::{
 };
 pub use gateway_plane_task::is_gateway_plane_task_envelope;
 pub use ope_inference::{
-    run_ope_inference_on_envelope, NdjsonStreamWriter, OpeInferenceOptions, OpeInferenceResult,
+    is_embeddings_request, run_ope_inference_on_envelope, NdjsonStreamWriter, OpeInferenceOptions,
+    OpeInferenceResult,
 };

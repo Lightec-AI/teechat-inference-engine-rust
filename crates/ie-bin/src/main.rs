@@ -22,7 +22,10 @@ use ie_engine::{
 };
 use ie_protocol::{AttestedConnectRequest, EngineEphemeralRegisterRequest};
 use ie_runtime::{env_map_from_process, load_engine_env_files, load_engine_plane_client_tls};
-use ie_upstream::{max_tokens_from_env, open_ai_chat_completions_url, VllmChatClient};
+use ie_upstream::{
+    embed_model_id_from_env, embeddings_config_from_env, max_tokens_from_env,
+    open_ai_chat_completions_url, VllmChatClient,
+};
 use ope_crypto::{encode, mock_keypair_from_seed, DEV_VECTOR_001_SEED};
 use rand::rngs::OsRng;
 use tokio::signal;
@@ -120,6 +123,8 @@ fn print_config(env: &HashMap<String, String>) {
         "TEECHAT_ENGINE_POOL_BASELINE",
         "TEECHAT_ENGINE_POOL_INITIAL_FRACTION",
         "TEECHAT_VLLM_BASE_URL",
+        "TEECHAT_EMBEDDINGS_UPSTREAM_URL",
+        "TEECHAT_EMBED_MODEL",
         "TEECHAT_BUILD",
         "TEECHAT_ENGINE_SLOT",
         "TEECHAT_ENGINE_STUB",
@@ -174,6 +179,9 @@ fn clone_inference_options(template: &OpeInferenceOptions) -> OpeInferenceOption
         provider: Arc::clone(&template.provider),
         vllm_base_url: template.vllm_base_url.clone(),
         vllm_api_key: template.vllm_api_key.clone(),
+        embeddings_base_url: template.embeddings_base_url.clone(),
+        embeddings_api_key: template.embeddings_api_key.clone(),
+        embeddings_default_model: template.embeddings_default_model.clone(),
         vllm: VllmChatClient::default(),
         chunk_chars: template.chunk_chars,
         kv: template.kv.clone(),
@@ -517,6 +525,10 @@ async fn run_engine(
         .await;
 
         let shared_kv = Arc::new(Mutex::new(HashMap::new()));
+        let (embeddings_base_url, embeddings_api_key) = match embeddings_config_from_env(env) {
+            Some((url, key)) => (Some(url), key),
+            None => (None, None),
+        };
         let inference_template = OpeInferenceOptions {
             request_id: None,
             decrypt_handle: 0,
@@ -524,6 +536,9 @@ async fn run_engine(
             provider: Arc::clone(&provider),
             vllm_base_url: upstream_base.clone(),
             vllm_api_key: env.get("VLLM_API_KEY").cloned(),
+            embeddings_base_url,
+            embeddings_api_key,
+            embeddings_default_model: embed_model_id_from_env(env),
             vllm: VllmChatClient::default(),
             chunk_chars: env
                 .get("TEECHAT_ENGINE_CHUNK_CHARS")
@@ -596,8 +611,11 @@ async fn run_engine(
 
     let _controls = install_engine_controls(Arc::clone(&pool), &engine_id, env).await?;
 
+    let embeddings_log = embeddings_config_from_env(env)
+        .map(|(url, _)| url)
+        .unwrap_or_else(|| "-".into());
     println!(
-        "[inference-engine] engine_id={engine_id} gateway={gateway} upstream={upstream_base} pool={pool_target_size} baseline={} models={} stub={force_stub}",
+        "[inference-engine] engine_id={engine_id} gateway={gateway} upstream={upstream_base} embeddings={embeddings_log} pool={pool_target_size} baseline={} models={} stub={force_stub}",
         pool_config.pool_baseline,
         models.join(",")
     );

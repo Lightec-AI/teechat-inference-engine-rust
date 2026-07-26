@@ -220,6 +220,9 @@ async fn mock_gateway_assign_work_decrypt_vllm_encrypt_result() {
         provider: provider.clone() as Arc<dyn CryptoProvider>,
         vllm_base_url: vllm.uri(),
         vllm_api_key: None,
+        embeddings_base_url: None,
+        embeddings_api_key: None,
+        embeddings_default_model: None,
         vllm: VllmChatClient::default(),
         chunk_chars: 8,
         kv: None,
@@ -256,4 +259,128 @@ async fn mock_gateway_assign_work_decrypt_vllm_encrypt_result() {
     assert!(body_str.contains("ope_stream") || body_str.contains("ciphertext"));
     let _ = protocol_env; // keep type linked
     let _: OpeEnvelope = protocol_env;
+}
+
+#[tokio::test]
+async fn mock_gateway_embeddings_tei_encrypt_result() {
+    let tei = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{ "object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3] }],
+            "model": "Qwen/Qwen3-Embedding-0.6B",
+            "usage": { "prompt_tokens": 3, "total_tokens": 3 }
+        })))
+        .mount(&tei)
+        .await;
+
+    let (secret, engine_pub) = test_mock_engine();
+    let provider = Arc::new(RealCryptoProvider::new());
+    let handle = provider.register_secret(secret).unwrap();
+    let client_session = ClientSession::generate().unwrap();
+    let sender = test_sender_keypair();
+
+    let payload = json!({
+        "model": "Qwen/Qwen3-Embedding-0.6B",
+        "input": "hello teechat"
+    });
+    let base = Envelope {
+        ope_version: Envelope::VERSION.into(),
+        alg: Envelope::ALG_EDDSA.into(),
+        enc: Envelope::ENC_NONE.into(),
+        kid: "sender-dev".into(),
+        recipient: "gateway-dev".into(),
+        engine_id: None,
+        ts: "2026-05-19T12:00:00Z".into(),
+        nonce: "bm9uY2VfZGV2X2UxZQ".into(),
+        payload_hash: String::new(),
+        payload: None,
+        ciphertext: None,
+        iv: None,
+        aad: None,
+        meta: Some(json!({
+            "model": "Qwen/Qwen3-Embedding-0.6B",
+            "conversation_id": "conv-embed",
+            "traffic_class": OPE_TRAFFIC_CLASS_LIVE_CHAT,
+            "openai_path": "/v1/embeddings",
+        })),
+        e2e: None,
+        sig: None,
+    };
+    let mut protocol_env =
+        client_encrypt_request(&engine_pub, &payload, base, Some(&client_session)).unwrap();
+    {
+        let mut ope = ie_crypto::protocol_to_ope_envelope(&protocol_env).unwrap();
+        sign_envelope(&mut ope, &sender.secret).unwrap();
+        protocol_env = ie_crypto::ope_to_protocol_envelope(&ope).unwrap();
+    }
+    if let Some(ref mut e2e) = protocol_env.e2e {
+        if e2e.ephemeral_epoch.is_empty() {
+            e2e.ephemeral_epoch = "epoch-test".into();
+        }
+    }
+    protocol_env.meta = Some(OpeEnvelopeMeta {
+        conversation_id: Some("conv-embed".into()),
+        model: Some("Qwen/Qwen3-Embedding-0.6B".into()),
+        tenant: None,
+        metering: None,
+        route: None,
+        traffic_class: Some(OPE_TRAFFIC_CLASS_LIVE_CHAT.into()),
+        gateway_task: None,
+    });
+
+    let envelope_bytes = serde_json::to_vec(&protocol_env).unwrap();
+    let gateway = Arc::new(MockGateway {
+        pulls: Mutex::new(VecDeque::from([H2BytesResponse {
+            status: 200,
+            headers: vec![
+                (HEADER_OPE_REQUEST_ID.into(), "req-embed".into()),
+                (HEADER_OPE_TRAFFIC_CLASS.into(), OPE_TRAFFIC_CLASS_LIVE_CHAT.into()),
+                (HEADER_OPE_SESSION_ID.into(), "sess-embed".into()),
+            ],
+            body: Bytes::from(envelope_bytes),
+        }])),
+        results: Arc::new(Mutex::new(Vec::new())),
+    });
+
+    let inference = OpeInferenceOptions {
+        request_id: None,
+        decrypt_handle: handle,
+        rotating: None,
+        provider: provider.clone() as Arc<dyn CryptoProvider>,
+        vllm_base_url: String::new(),
+        vllm_api_key: None,
+        embeddings_base_url: Some(tei.uri()),
+        embeddings_api_key: None,
+        embeddings_default_model: Some("Qwen/Qwen3-Embedding-0.6B".into()),
+        vllm: VllmChatClient::default(),
+        chunk_chars: 8,
+        kv: None,
+        usage_signing_key: None,
+    };
+
+    let worker = start_pull_worker(gateway.clone(), "sess-embed".into(), inference, None, None);
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        if !gateway.results.lock().unwrap().is_empty() {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            worker.stop();
+            panic!("timed out waiting for embeddings inference result");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    worker.stop();
+    worker.join().await;
+
+    let results = gateway.results.lock().unwrap();
+    assert_eq!(results.len(), 1);
+    let body_str = String::from_utf8_lossy(&results[0].1);
+    assert!(
+        body_str.contains("ope_stream") || body_str.contains("ciphertext"),
+        "expected OPE stream frames, got: {body_str}"
+    );
 }

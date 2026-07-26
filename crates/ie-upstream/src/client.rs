@@ -48,6 +48,62 @@ pub fn open_ai_chat_completions_url(base_url: &str) -> String {
     }
 }
 
+/// OpenAI-compatible embeddings URL for CPU TEI (or any `/v1/embeddings` upstream).
+pub fn open_ai_embeddings_url(base_url: &str) -> String {
+    let base = normalize_base_url(base_url);
+    if base.ends_with("/embeddings") {
+        base
+    } else if base.ends_with("/v1") {
+        format!("{base}/embeddings")
+    } else {
+        format!("{base}/v1/embeddings")
+    }
+}
+
+/// CPU TEI / OpenAI-compatible embeddings on the engine guest loopback.
+pub fn embeddings_config_from_env(env: &HashMap<String, String>) -> Option<(String, Option<String>)> {
+    let base_url = env
+        .get("TEECHAT_EMBEDDINGS_UPSTREAM_URL")
+        .or_else(|| env.get("VLLM_EMBED_BASE_URL"))
+        .or_else(|| env.get("TEECHAT_VLLM_EMBED_BASE_URL"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let api_key = env
+        .get("TEECHAT_EMBEDDINGS_API_KEY")
+        .or_else(|| env.get("VLLM_EMBED_API_KEY"))
+        .or_else(|| env.get("VLLM_API_KEY"))
+        .or_else(|| env.get("TEECHAT_VLLM_API_KEY"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some((base_url, api_key))
+}
+
+pub fn embed_model_id_from_env(env: &HashMap<String, String>) -> Option<String> {
+    env.get("TEECHAT_EMBED_MODEL")
+        .or_else(|| env.get("VLLM_EMBED_MODEL"))
+        .or_else(|| env.get("TEECHAT_EMBEDDINGS_MODEL"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddingsCompleteOptions {
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub model: String,
+    pub input: Value,
+    pub extra: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddingsCompleteResult {
+    pub body: Value,
+    pub prompt_tokens: u64,
+}
+
 pub fn merge_vllm_thinking_into_body(mut body: Value, enable_thinking: bool) -> Value {
     let mut extra = body
         .get("extra_body")
@@ -213,6 +269,60 @@ impl VllmChatClient {
             .trim()
             .to_string())
     }
+
+    /// Non-streaming `POST /v1/embeddings` → OpenAI-shaped JSON body + prompt token count.
+    pub async fn complete_embeddings(
+        &self,
+        opts: EmbeddingsCompleteOptions,
+    ) -> Result<EmbeddingsCompleteResult, UpstreamError> {
+        let url = open_ai_embeddings_url(&opts.base_url);
+        let mut payload = json!({
+            "model": opts.model,
+            "input": opts.input,
+        });
+        if let Some(extra) = opts.extra {
+            if let (Some(obj), Some(extra_obj)) = (payload.as_object_mut(), extra.as_object()) {
+                for (k, v) in extra_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let mut req = self.http.post(url).json(&payload);
+        if let Some(key) = opts.api_key.as_deref().filter(|k| !k.is_empty()) {
+            req = req.bearer_auth(key);
+        }
+
+        let res = req.send().await?;
+        if !res.status().is_success() {
+            let status = res.status().as_u16();
+            let body = res.text().await.unwrap_or_default();
+            return Err(UpstreamError::Http {
+                status,
+                body: body.chars().take(500).collect(),
+            });
+        }
+
+        let body: Value = res.json().await?;
+        let usage = body.get("usage").cloned().unwrap_or(Value::Null);
+        let prompt_tokens = usage
+            .get("prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .filter(|n| *n > 0)
+            .or_else(|| {
+                usage
+                    .get("total_tokens")
+                    .and_then(|v| v.as_u64())
+                    .filter(|n| *n > 0)
+            })
+            .unwrap_or_else(|| {
+                let approx = opts.input.to_string().len() as f64 / 4.0;
+                (approx.ceil() as u64).max(1)
+            });
+        Ok(EmbeddingsCompleteResult {
+            body,
+            prompt_tokens,
+        })
+    }
 }
 
 struct VllmSseStream<S> {
@@ -309,5 +419,33 @@ mod tests {
             open_ai_chat_completions_url("http://127.0.0.1:8000/v1"),
             "http://127.0.0.1:8000/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn embeddings_url_normalizes_base() {
+        assert_eq!(
+            open_ai_embeddings_url("http://127.0.0.1:8090/"),
+            "http://127.0.0.1:8090/v1/embeddings"
+        );
+        assert_eq!(
+            open_ai_embeddings_url("http://127.0.0.1:8090/v1"),
+            "http://127.0.0.1:8090/v1/embeddings"
+        );
+        assert_eq!(
+            open_ai_embeddings_url("http://127.0.0.1:8090/v1/embeddings"),
+            "http://127.0.0.1:8090/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn embeddings_config_from_env_reads_tei_url() {
+        let mut env = HashMap::new();
+        env.insert(
+            "TEECHAT_EMBEDDINGS_UPSTREAM_URL".into(),
+            "http://127.0.0.1:8090".into(),
+        );
+        let (url, key) = embeddings_config_from_env(&env).expect("config");
+        assert_eq!(url, "http://127.0.0.1:8090");
+        assert!(key.is_none());
     }
 }

@@ -53,9 +53,9 @@ pub use ops::{
     ConversationKvState, EventLogLevel, PrefillPlan, DEFAULT_ENGINE_INSTANCE_ID,
 };
 pub use infer::{
-    ope_inference_reject_body, run_ope_inference_on_envelope, validate_ope_inference_content_type,
-    validate_ope_inference_envelope, GateResult, NdjsonStreamWriter, OpeInferenceGateError,
-    OpeInferenceOptions, OpeInferenceResult,
+    is_embeddings_request, ope_inference_reject_body, run_ope_inference_on_envelope,
+    validate_ope_inference_content_type, validate_ope_inference_envelope, GateResult,
+    NdjsonStreamWriter, OpeInferenceGateError, OpeInferenceOptions, OpeInferenceResult,
 };
 pub use plane::{
     build_connect_request, generate_gateway_connect_challenge_nonce,

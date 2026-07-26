@@ -10,9 +10,9 @@ use ie_protocol::{
 };
 use ie_upstream::{
     clamp_vllm_max_tokens, estimate_prompt_tokens_from_messages, normalize_vllm_messages,
-    VllmChatClient, VllmStreamOptions, VLLM_MAX_TOKENS_DEFAULT,
+    EmbeddingsCompleteOptions, VllmChatClient, VllmStreamOptions, VLLM_MAX_TOKENS_DEFAULT,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::ops::{conversation_kv_key, plan_vllm_prefill, ConversationKvState};
@@ -43,6 +43,11 @@ pub struct OpeInferenceOptions {
     pub provider: Arc<dyn CryptoProvider>,
     pub vllm_base_url: String,
     pub vllm_api_key: Option<String>,
+    /// CPU TEI / OpenAI-compatible embeddings upstream (engine loopback).
+    pub embeddings_base_url: Option<String>,
+    pub embeddings_api_key: Option<String>,
+    /// Fallback model id when the decrypted payload omits `model`.
+    pub embeddings_default_model: Option<String>,
     pub vllm: VllmChatClient,
     pub chunk_chars: usize,
     /// Shared across pull workers so KV prefill warms survive session affinity.
@@ -83,7 +88,24 @@ fn strip_model_provider(model: &str) -> String {
     }
 }
 
-/// Decrypt → vLLM stream → encrypt OPE response chunks (JSON or NDJSON).
+/// Detect OpenAI embeddings vs chat after decrypt (TS `isEmbeddingsRequest` parity).
+///
+/// Prefers payload shape (`input` without chat `messages`) because typed
+/// `OpeEnvelopeMeta` does not yet carry `openai_path`.
+pub fn is_embeddings_request(payload: &Value) -> bool {
+    let has_input = payload.get("input").is_some();
+    if !has_input {
+        return false;
+    }
+    match payload.get("messages") {
+        None => true,
+        Some(Value::Array(a)) if a.is_empty() => true,
+        Some(Value::Null) => true,
+        _ => false,
+    }
+}
+
+/// Decrypt → vLLM/TEI → encrypt OPE response chunks (JSON or NDJSON).
 ///
 /// When `ndjson_out` is `Some`, ciphertext frames are appended as NDJSON lines.
 pub async fn run_ope_inference_on_envelope(
@@ -118,15 +140,6 @@ pub async fn run_ope_inference_on_envelope(
         }
     }
 
-    if options.vllm_base_url.trim().is_empty() {
-        return OpeInferenceResult {
-            status: 503,
-            content_type: "application/json".into(),
-            body: json!({ "error": "vllm_not_configured" }).to_string(),
-            usage_header: None,
-        };
-    }
-
     let decrypt_handle = match resolve_decrypt_handle(options, envelope) {
         Ok(h) => h,
         Err(e) => {
@@ -151,6 +164,208 @@ pub async fn run_ope_inference_on_envelope(
         }
     };
 
+    if is_embeddings_request(&payload) {
+        let Some(base_url) = options
+            .embeddings_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return OpeInferenceResult {
+                status: 503,
+                content_type: "application/json".into(),
+                body: json!({ "error": "embeddings_not_configured" }).to_string(),
+                usage_header: None,
+            };
+        };
+        return run_embeddings_inference(
+            envelope,
+            &payload,
+            options,
+            base_url,
+            &mut ndjson_out,
+        )
+        .await;
+    }
+
+    if options.vllm_base_url.trim().is_empty() {
+        return OpeInferenceResult {
+            status: 503,
+            content_type: "application/json".into(),
+            body: json!({ "error": "vllm_not_configured" }).to_string(),
+            usage_header: None,
+        };
+    }
+
+    run_chat_inference(envelope, &payload, options, decrypt_handle, ndjson_out).await
+}
+
+async fn run_embeddings_inference(
+    envelope: &OpeEnvelope,
+    payload: &Value,
+    options: &OpeInferenceOptions,
+    embeddings_base_url: &str,
+    ndjson_out: &mut Option<&mut dyn NdjsonStreamWriter>,
+) -> OpeInferenceResult {
+    let decrypt_handle = match resolve_decrypt_handle(options, envelope) {
+        Ok(h) => h,
+        Err(e) => {
+            return OpeInferenceResult {
+                status: 400,
+                content_type: "application/json".into(),
+                body: json!({ "error": "decrypt_failed", "detail": e }).to_string(),
+                usage_header: None,
+            };
+        }
+    };
+
+    let conv_id = envelope
+        .meta
+        .as_ref()
+        .and_then(|m| m.conversation_id.clone())
+        .unwrap_or_else(|| "conv".into());
+    let model_raw = payload
+        .get("model")
+        .and_then(|m| m.as_str())
+        .or_else(|| envelope.meta.as_ref().and_then(|m| m.model.as_deref()))
+        .or(options.embeddings_default_model.as_deref())
+        .unwrap_or("unknown");
+    let model = strip_model_provider(model_raw);
+
+    let mut extra = json!({});
+    if let Some(dims) = payload.get("dimensions").and_then(|v| v.as_u64()) {
+        extra["dimensions"] = json!(dims);
+    }
+    if let Some(fmt) = payload.get("encoding_format").and_then(|v| v.as_str()) {
+        extra["encoding_format"] = json!(fmt);
+    }
+    let extra = if extra.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+        Some(extra)
+    } else {
+        None
+    };
+
+    let input = payload
+        .get("input")
+        .cloned()
+        .unwrap_or(Value::String(String::new()));
+
+    // Call TEI before writing any OPE stream bytes (chat parity for status mapping).
+    let completed = options
+        .vllm
+        .complete_embeddings(EmbeddingsCompleteOptions {
+            base_url: embeddings_base_url.to_string(),
+            api_key: options.embeddings_api_key.clone(),
+            model: model.clone(),
+            input,
+            extra,
+        })
+        .await;
+
+    let completed = match completed {
+        Ok(c) => c,
+        Err(e) => {
+            return embeddings_upstream_failed_result(&e);
+        }
+    };
+
+    let resp = match options.provider.begin_response(decrypt_handle, envelope) {
+        Ok(r) => r,
+        Err(e) => {
+            return OpeInferenceResult {
+                status: 400,
+                content_type: "application/json".into(),
+                body: json!({ "error": "begin_response_failed", "detail": e.to_string() })
+                    .to_string(),
+                usage_header: None,
+            };
+        }
+    };
+
+    let streaming = ndjson_out.is_some();
+    if let Some(out) = ndjson_out.as_mut() {
+        if let Ok(line) = encode_ope_stream_line(&OpeStreamFrame::server_share(&resp.server_share)) {
+            out.write(&line);
+        }
+    }
+
+    let json_text = completed.body.to_string();
+    let mut chunks: Vec<String> = Vec::new();
+    let mut seq: u32 = 0;
+    encrypt_piece(
+        options.provider.as_ref(),
+        resp.session,
+        &json_text,
+        true,
+        &mut seq,
+        &mut chunks,
+        ndjson_out,
+    );
+    options.provider.free_response(resp.session);
+
+    let report = ie_protocol::UsageReport {
+        request_id: options
+            .request_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        conversation_id: conv_id,
+        engine_id: envelope
+            .engine_id
+            .clone()
+            .unwrap_or_else(|| "engine".into()),
+        prompt_tokens: completed.prompt_tokens,
+        completion_tokens: 0,
+        ts: chrono::Utc::now().to_rfc3339(),
+    };
+    let usage_header = match &options.usage_signing_key {
+        Some(key) => {
+            let sig = crate::ops::sign_usage_report(key, &report);
+            let signed = ie_protocol::SignedUsageReport { report, sig };
+            Some(ope_crypto::encode(
+                serde_json::to_string(&signed).unwrap_or_default().as_bytes(),
+            ))
+        }
+        None => {
+            warn!("usage_signing_key missing; omitting usage header");
+            None
+        }
+    };
+
+    if streaming {
+        if let Some(out) = ndjson_out.as_mut() {
+            if let Ok(line) = encode_ope_stream_line(&OpeStreamFrame::trailer(usage_header.clone())) {
+                out.write(&line);
+            }
+            out.end();
+        }
+        return OpeInferenceResult {
+            status: 200,
+            content_type: CONTENT_TYPE_OPE_JSON_STREAM.into(),
+            body: String::new(),
+            usage_header,
+        };
+    }
+
+    OpeInferenceResult {
+        status: 200,
+        content_type: CONTENT_TYPE_OPE_JSON.into(),
+        body: json!({
+            "server_share": resp.server_share,
+            "chunks": chunks,
+            "engine_prefill_tokens": 0,
+        })
+        .to_string(),
+        usage_header,
+    }
+}
+
+async fn run_chat_inference(
+    envelope: &OpeEnvelope,
+    payload: &Value,
+    options: &OpeInferenceOptions,
+    decrypt_handle: u64,
+    mut ndjson_out: Option<&mut dyn NdjsonStreamWriter>,
+) -> OpeInferenceResult {
     let conv_id = envelope
         .meta
         .as_ref()
@@ -382,6 +597,20 @@ fn vllm_upstream_failed_result(err: &ie_upstream::UpstreamError) -> OpeInference
     }
 }
 
+fn embeddings_upstream_failed_result(err: &ie_upstream::UpstreamError) -> OpeInferenceResult {
+    let status = match err {
+        ie_upstream::UpstreamError::Http { status, .. } if (400..500).contains(status) => *status,
+        _ => 502,
+    };
+    OpeInferenceResult {
+        status,
+        content_type: "application/json".into(),
+        body: json!({ "error": "embeddings_upstream_failed", "detail": err.to_string() })
+            .to_string(),
+        usage_header: None,
+    }
+}
+
 fn encrypt_piece(
     provider: &dyn CryptoProvider,
     session: u64,
@@ -405,5 +634,30 @@ fn encrypt_piece(
             *seq += 1;
         }
         Err(e) => warn!(error = %e, "encrypt_response_chunk failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embeddings_request_detects_input_without_messages() {
+        assert!(is_embeddings_request(&json!({
+            "model": "Qwen/Qwen3-Embedding-0.6B",
+            "input": "hello",
+        })));
+        assert!(is_embeddings_request(&json!({
+            "input": ["a", "b"],
+            "messages": [],
+        })));
+        assert!(!is_embeddings_request(&json!({
+            "model": "chat",
+            "messages": [{"role": "user", "content": "hi"}],
+        })));
+        assert!(!is_embeddings_request(&json!({
+            "input": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+        })));
     }
 }

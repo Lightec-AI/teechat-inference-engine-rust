@@ -24,10 +24,10 @@ Gate: `cargo test --workspace` + `cargo clippy --workspace --all-targets -- -D w
 | `metering.test.ts` | `ie-engine/src/ops/metering.rs` | Usage report signing |
 | `prefill.test.ts` | `ie-engine/src/ops/prefill.rs` | KV prefill planner |
 | `instance-id.test.ts` | `ie-engine/src/ops/instance_id.rs` | Slot / instance id |
-| `ope-inference*.test.ts` | `ie-engine/src/infer` + `tests/pull_infer_roundtrip.rs` | Gate + decrypt/encrypt + mock H2 IT |
+| `ope-inference*.test.ts` | `ie-engine/src/infer` + `tests/pull_infer_roundtrip.rs` | Gate + decrypt/encrypt + mock H2 IT; embeddings → TEI `/v1/embeddings` |
 | `pool-client-session-errors.test.ts` | `ie-engine/src/plane` | Transport + pull worker errors |
 | `native-ope-ffi*.test.ts` | — | **Excluded** — Rust uses `ope-e2e` in-process, not koffi FFI |
-| `vllm-chat*.test.ts` | `ie-upstream/src/client.rs` | Partial SSE/routing coverage |
+| `vllm-chat*.test.ts` | `ie-upstream/src/client.rs` | Partial SSE/routing + embeddings URL/config |
 | `browser-trust.test.ts` | — | **Excluded** — browser/WASM client scope |
 
 ## Measurement invariants (must not regress)
