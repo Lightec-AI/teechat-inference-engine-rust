@@ -163,12 +163,20 @@ fn verify_gateway_platform_enabled(env: &HashMap<String, String>) -> bool {
 }
 
 fn models_from_env(env: &HashMap<String, String>) -> Vec<String> {
-    env.get("OLLAMA_MODEL")
+    let mut models = env
+        .get("OLLAMA_MODEL")
         .or_else(|| env.get("TEECHAT_OLLAMA_MODEL"))
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| vec![s.to_string()])
-        .unwrap_or_else(|| vec!["google/gemma-4-31B-it".into()])
+        .unwrap_or_else(|| vec!["google/gemma-4-31B-it".into()]);
+    // Advertise the embeddings model so gateway OPE inventory can route /v1/embeddings.
+    if let Some(embed) = embed_model_id_from_env(env) {
+        if !models.iter().any(|m| m == &embed) {
+            models.push(embed);
+        }
+    }
+    models
 }
 
 fn clone_inference_options(template: &OpeInferenceOptions) -> OpeInferenceOptions {
