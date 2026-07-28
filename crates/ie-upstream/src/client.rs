@@ -169,22 +169,19 @@ pub struct EmbeddingsCompleteResult {
     pub prompt_tokens: u64,
 }
 
+/// Merge `chat_template_kwargs.enable_thinking` for a raw vLLM HTTP body.
+///
+/// Must be top-level `chat_template_kwargs` (not OpenAI-SDK `extra_body`) — vLLM
+/// ignores nested `extra_body` on `/v1/chat/completions`.
 pub fn merge_vllm_thinking_into_body(mut body: Value, enable_thinking: bool) -> Value {
-    let mut extra = body
-        .get("extra_body")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let mut kwargs = extra
+    let mut kwargs = body
         .get("chat_template_kwargs")
         .cloned()
         .unwrap_or_else(|| json!({}));
     if let Some(obj) = kwargs.as_object_mut() {
         obj.insert("enable_thinking".into(), json!(enable_thinking));
     }
-    if let Some(obj) = extra.as_object_mut() {
-        obj.insert("chat_template_kwargs".into(), kwargs);
-    }
-    body["extra_body"] = extra;
+    body["chat_template_kwargs"] = kwargs;
     body
 }
 
