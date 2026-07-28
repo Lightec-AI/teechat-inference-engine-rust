@@ -15,4 +15,7 @@ pub use client::{
 };
 pub use error::UpstreamError;
 pub use multimodal::{estimate_prompt_tokens_from_messages, normalize_vllm_messages};
-pub use sse::{parse_sse_data_line, stream_text_from_vllm_choice};
+pub use sse::{
+    parse_sse_data_line, stream_deltas_from_vllm_choice, stream_text_from_vllm_choice,
+    VllmTextDelta, VllmTextKind, STREAM_THINKING_SEPARATOR,
+};

@@ -5,7 +5,9 @@ use futures::{Stream, StreamExt};
 use reqwest::Client;
 use serde_json::{json, Value};
 
-use crate::sse::{parse_sse_data_line, stream_text_from_vllm_choice};
+use crate::sse::{
+    parse_sse_data_line, stream_deltas_from_vllm_choice, VllmTextKind, STREAM_THINKING_SEPARATOR,
+};
 use crate::UpstreamError;
 
 pub const VLLM_MAX_TOKENS_DEFAULT: u32 = 4096;
@@ -290,7 +292,13 @@ impl VllmChatClient {
             .bytes_stream()
             .map(|chunk| chunk.map_err(UpstreamError::from));
 
-        Ok(VllmSseStream { byte_stream, buffer: String::new() })
+        Ok(VllmSseStream {
+            byte_stream,
+            buffer: String::new(),
+            pending: std::collections::VecDeque::new(),
+            saw_reasoning: false,
+            reasoning_boundary_emitted: false,
+        })
     }
 
     pub async fn complete_chat(&self, opts: VllmCompleteOptions) -> Result<String, UpstreamError> {
@@ -391,6 +399,11 @@ impl VllmChatClient {
 struct VllmSseStream<S> {
     byte_stream: S,
     buffer: String,
+    /// Pieces ready to yield (reasoning/content + optional thinking separator).
+    pending: std::collections::VecDeque<String>,
+    /// True after any reasoning delta; next content gets a TeeChat thinking separator.
+    saw_reasoning: bool,
+    reasoning_boundary_emitted: bool,
 }
 
 impl<S> Stream for VllmSseStream<S>
@@ -404,10 +417,15 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         loop {
+            if let Some(text) = self.pending.pop_front() {
+                return std::task::Poll::Ready(Some(Ok(text)));
+            }
+
             while let Some(newline_idx) = self.buffer.find('\n') {
                 let line: String = self.buffer.drain(..=newline_idx).collect();
                 let line = line.trim_end_matches('\n').trim_end_matches('\r').trim();
-                if let Some(text) = process_sse_line(line)? {
+                self.enqueue_sse_line(line)?;
+                if let Some(text) = self.pending.pop_front() {
                     return std::task::Poll::Ready(Some(Ok(text)));
                 }
             }
@@ -420,11 +438,17 @@ where
                     return std::task::Poll::Ready(Some(Err(e)));
                 }
                 std::task::Poll::Ready(None) => {
-                    if self.buffer.is_empty() {
-                        return std::task::Poll::Ready(None);
+                    if !self.buffer.is_empty() {
+                        let line = std::mem::take(&mut self.buffer);
+                        self.enqueue_sse_line(line.trim())?;
                     }
-                    let line = std::mem::take(&mut self.buffer);
-                    if let Some(text) = process_sse_line(line.trim())? {
+                    // Thinking-only streams still need the fold boundary for the client UI.
+                    if self.saw_reasoning && !self.reasoning_boundary_emitted {
+                        self.reasoning_boundary_emitted = true;
+                        self.pending
+                            .push_back(STREAM_THINKING_SEPARATOR.to_string());
+                    }
+                    if let Some(text) = self.pending.pop_front() {
                         return std::task::Poll::Ready(Some(Ok(text)));
                     }
                     return std::task::Poll::Ready(None);
@@ -435,21 +459,45 @@ where
     }
 }
 
-fn process_sse_line(line: &str) -> Result<Option<String>, UpstreamError> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with("data:") {
-        return Ok(None);
+impl<S> VllmSseStream<S> {
+    fn enqueue_sse_line(&mut self, line: &str) -> Result<(), UpstreamError> {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("data:") {
+            return Ok(());
+        }
+        let data = trimmed.strip_prefix("data:").unwrap_or("").trim();
+        if data == "[DONE]" {
+            return Ok(());
+        }
+        let chunk = match parse_sse_data_line(data)? {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+        let Some(choice) = chunk
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first())
+        else {
+            return Ok(());
+        };
+        for delta in stream_deltas_from_vllm_choice(choice) {
+            match delta.kind {
+                VllmTextKind::Reasoning => {
+                    self.saw_reasoning = true;
+                    self.pending.push_back(delta.text);
+                }
+                VllmTextKind::Content => {
+                    if self.saw_reasoning && !self.reasoning_boundary_emitted {
+                        self.reasoning_boundary_emitted = true;
+                        self.pending
+                            .push_back(STREAM_THINKING_SEPARATOR.to_string());
+                    }
+                    self.pending.push_back(delta.text);
+                }
+            }
+        }
+        Ok(())
     }
-    let data = trimmed.strip_prefix("data:").unwrap_or("").trim();
-    if data == "[DONE]" {
-        return Ok(None);
-    }
-    let chunk = match parse_sse_data_line(data)? {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-    let choice = chunk.get("choices").and_then(|c| c.as_array()).and_then(|c| c.first());
-    Ok(choice.and_then(stream_text_from_vllm_choice))
 }
 
 pub fn vllm_config_from_env(env: &HashMap<String, String>) -> Option<(String, Option<String>)> {
