@@ -10,7 +10,8 @@ use ie_protocol::{
 };
 use ie_upstream::{
     clamp_vllm_max_tokens, estimate_prompt_tokens_from_messages, normalize_vllm_messages,
-    EmbeddingsCompleteOptions, VllmChatClient, VllmStreamOptions, VLLM_MAX_TOKENS_DEFAULT,
+    resolve_vllm_base_url_for_model, EmbeddingsCompleteOptions, VllmChatClient, VllmStreamOptions,
+    VLLM_MAX_TOKENS_DEFAULT,
 };
 use serde_json::{json, Value};
 use tracing::warn;
@@ -43,6 +44,11 @@ pub struct OpeInferenceOptions {
     pub provider: Arc<dyn CryptoProvider>,
     pub vllm_base_url: String,
     pub vllm_api_key: Option<String>,
+    /// Task vLLM upstream (localhost :8001) for background / E4B model ids.
+    pub task_vllm_base_url: Option<String>,
+    pub task_vllm_api_key: Option<String>,
+    /// Model id served on the task upstream (`TEECHAT_TASK_MODEL`).
+    pub task_model_id: Option<String>,
     /// CPU TEI / OpenAI-compatible embeddings upstream (engine loopback).
     pub embeddings_base_url: Option<String>,
     pub embeddings_api_key: Option<String>,
@@ -114,10 +120,23 @@ pub async fn run_ope_inference_on_envelope(
     mut ndjson_out: Option<&mut dyn NdjsonStreamWriter>,
 ) -> OpeInferenceResult {
     if super::gateway_plane_task::is_gateway_plane_task_envelope(envelope) {
+        let model = envelope
+            .meta
+            .as_ref()
+            .and_then(|m| m.model.as_deref())
+            .unwrap_or("unknown");
+        let (base_url, _model, api_key, _is_task) = resolve_vllm_base_url_for_model(
+            model,
+            &options.vllm_base_url,
+            options.vllm_api_key.as_deref(),
+            options.task_model_id.as_deref(),
+            options.task_vllm_base_url.as_deref(),
+            options.task_vllm_api_key.as_deref(),
+        );
         return super::gateway_plane_task::run_gateway_plane_task_inference(
             envelope,
-            &options.vllm_base_url,
-            options.vllm_api_key.clone(),
+            &base_url,
+            api_key,
             &options.vllm,
             options.request_id.as_deref(),
         )
@@ -376,7 +395,14 @@ async fn run_chat_inference(
         .and_then(|m| m.as_str())
         .or_else(|| envelope.meta.as_ref().and_then(|m| m.model.as_deref()))
         .unwrap_or("unknown");
-    let model = strip_model_provider(model_raw);
+    let (vllm_base_url, model, vllm_api_key, is_task_model) = resolve_vllm_base_url_for_model(
+        model_raw,
+        &options.vllm_base_url,
+        options.vllm_api_key.as_deref(),
+        options.task_model_id.as_deref(),
+        options.task_vllm_base_url.as_deref(),
+        options.task_vllm_api_key.as_deref(),
+    );
     let messages = normalize_vllm_messages(
         payload
             .get("messages")
@@ -437,19 +463,20 @@ async fn run_chat_inference(
     let stream = options
         .vllm
         .stream_chat_completion(VllmStreamOptions {
-            base_url: options.vllm_base_url.clone(),
+            base_url: vllm_base_url,
             model: model.clone(),
             messages,
-            api_key: options.vllm_api_key.clone(),
+            api_key: vllm_api_key,
             max_tokens: max_tokens.or(Some(VLLM_MAX_TOKENS_DEFAULT)),
             frequency_penalty: payload.get("frequency_penalty").and_then(|v| v.as_f64()),
             presence_penalty: payload.get("presence_penalty").and_then(|v| v.as_f64()),
             temperature: payload.get("temperature").and_then(|v| v.as_f64()),
             top_p: payload.get("top_p").and_then(|v| v.as_f64()),
+            // Task model must stay non-thinking (titles / search prep / digests).
             enable_thinking: payload
                 .get("enable_thinking")
                 .and_then(|v| v.as_bool())
-                .or(Some(true)),
+                .or(Some(!is_task_model)),
         })
         .await;
 

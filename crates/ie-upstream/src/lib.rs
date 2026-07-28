@@ -8,7 +8,8 @@ mod sse;
 pub use client::{
     build_vllm_chat_body, clamp_open_ai_penalty, clamp_vllm_max_tokens, embed_model_id_from_env,
     embeddings_config_from_env, max_tokens_from_env, open_ai_chat_completions_url,
-    open_ai_embeddings_url, vllm_config_from_env, EmbeddingsCompleteOptions,
+    open_ai_embeddings_url, resolve_vllm_base_url_for_model, task_model_id_from_env,
+    vllm_config_from_env, vllm_task_config_from_env, EmbeddingsCompleteOptions,
     EmbeddingsCompleteResult, VllmChatClient, VllmCompleteOptions, VllmStreamOptions,
     VLLM_MAX_TOKENS_DEFAULT, VLLM_MAX_TOKENS_MAX, VLLM_MAX_TOKENS_MIN,
 };

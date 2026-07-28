@@ -2,9 +2,31 @@
 
 use serde_json::{json, Value};
 
+fn content_to_plain_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                let obj = part.as_object()?;
+                if obj.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    obj.get("text").and_then(|t| t.as_str()).map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => other.to_string(),
+    }
+}
+
 /// Normalize decrypted OPE messages for OpenAI-compatible vLLM upstream.
+///
+/// Hoists every `system` turn to the front (merged) — Gemma chat templates
+/// reject system messages that appear after the first non-system turn.
 pub fn normalize_vllm_messages(messages: &[Value]) -> Vec<Value> {
-    messages
+    let mapped: Vec<Value> = messages
         .iter()
         .map(|m| {
             let role = m
@@ -56,7 +78,35 @@ pub fn normalize_vllm_messages(messages: &[Value]) -> Vec<Value> {
                 None => json!({ "role": role, "content": "" }),
             }
         })
-        .collect()
+        .collect();
+
+    let mut system_texts: Vec<String> = Vec::new();
+    let mut rest: Vec<Value> = Vec::new();
+    for m in &mapped {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        if role == "system" {
+            let t = m
+                .get("content")
+                .map(content_to_plain_text)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !t.is_empty() {
+                system_texts.push(t);
+            }
+            continue;
+        }
+        rest.push(m.clone());
+    }
+    if system_texts.is_empty() {
+        return mapped;
+    }
+    let mut out = vec![json!({
+        "role": "system",
+        "content": system_texts.join("\n\n"),
+    })];
+    out.extend(rest);
+    out
 }
 
 /// Rough prompt-token estimate (chars/4 + 512 per image), matching TS.
@@ -100,6 +150,22 @@ mod tests {
         let msgs = vec![json!({"role": "user", "content": "hi"})];
         let out = normalize_vllm_messages(&msgs);
         assert_eq!(out[0]["content"], "hi");
+    }
+
+    #[test]
+    fn normalize_hoists_mid_thread_system() {
+        let msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+            json!({"role": "system", "content": "search context"}),
+            json!({"role": "user", "content": "again"}),
+        ];
+        let out = normalize_vllm_messages(&msgs);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], "search context");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[3]["role"], "user");
     }
 
     #[test]

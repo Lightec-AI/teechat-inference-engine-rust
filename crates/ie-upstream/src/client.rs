@@ -89,6 +89,69 @@ pub fn embed_model_id_from_env(env: &HashMap<String, String>) -> Option<String> 
         .map(str::to_string)
 }
 
+/// Task vLLM upstream (localhost :8001 inside prod-engine guest).
+pub fn vllm_task_config_from_env(env: &HashMap<String, String>) -> Option<(String, Option<String>)> {
+    let base_url = env
+        .get("VLLM_TASK_BASE_URL")
+        .or_else(|| env.get("TEECHAT_TASK_VLLM_BASE_URL"))
+        .or_else(|| env.get("TEECHAT_VLLM_TASK_BASE_URL"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let api_key = env
+        .get("VLLM_TASK_API_KEY")
+        .or_else(|| env.get("TEECHAT_TASK_VLLM_API_KEY"))
+        .or_else(|| env.get("VLLM_API_KEY"))
+        .or_else(|| env.get("TEECHAT_VLLM_API_KEY"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some((base_url, api_key))
+}
+
+pub fn task_model_id_from_env(env: &HashMap<String, String>) -> Option<String> {
+    env.get("TEECHAT_TASK_MODEL")
+        .or_else(|| env.get("VITE_TASK_MODEL"))
+        .or_else(|| env.get("VLLM_TASK_MODEL"))
+        .or_else(|| env.get("OLLAMA_TASK_MODEL"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn strip_model_provider(model: &str) -> &str {
+    match model.find('@') {
+        Some(at) => &model[..at],
+        None => model,
+    }
+}
+
+/// Route task-model ids to the task vLLM base URL; main chat models use the primary upstream.
+pub fn resolve_vllm_base_url_for_model(
+    model: &str,
+    main_base_url: &str,
+    main_api_key: Option<&str>,
+    task_model_id: Option<&str>,
+    task_base_url: Option<&str>,
+    task_api_key: Option<&str>,
+) -> (String, String, Option<String>, bool) {
+    let stripped = strip_model_provider(model).to_string();
+    if let (Some(task_id), Some(task_url)) = (task_model_id, task_base_url) {
+        if strip_model_provider(task_id) == stripped.as_str() {
+            let key = task_api_key
+                .map(str::to_string)
+                .or_else(|| main_api_key.map(str::to_string));
+            return (task_url.to_string(), stripped, key, true);
+        }
+    }
+    (
+        main_base_url.to_string(),
+        stripped,
+        main_api_key.map(str::to_string),
+        false,
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct EmbeddingsCompleteOptions {
     pub base_url: String,
@@ -447,5 +510,38 @@ mod tests {
         let (url, key) = embeddings_config_from_env(&env).expect("config");
         assert_eq!(url, "http://127.0.0.1:8090");
         assert!(key.is_none());
+    }
+
+    #[test]
+    fn task_config_from_env_reads_task_vllm() {
+        let mut env = HashMap::new();
+        env.insert(
+            "VLLM_TASK_BASE_URL".into(),
+            "http://127.0.0.1:8001/v1".into(),
+        );
+        env.insert("TEECHAT_TASK_MODEL".into(), "google/gemma-4-E4B-it".into());
+        let (url, key) = vllm_task_config_from_env(&env).expect("task url");
+        assert_eq!(url, "http://127.0.0.1:8001/v1");
+        assert!(key.is_none());
+        assert_eq!(
+            task_model_id_from_env(&env).as_deref(),
+            Some("google/gemma-4-E4B-it")
+        );
+    }
+
+    #[test]
+    fn resolve_routes_task_model_to_task_upstream() {
+        let (url, model, key, is_task) = resolve_vllm_base_url_for_model(
+            "google/gemma-4-E4B-it@teechat",
+            "http://127.0.0.1:8000/v1",
+            Some("main-key"),
+            Some("google/gemma-4-E4B-it"),
+            Some("http://127.0.0.1:8001/v1"),
+            None,
+        );
+        assert_eq!(url, "http://127.0.0.1:8001/v1");
+        assert_eq!(model, "google/gemma-4-E4B-it");
+        assert_eq!(key.as_deref(), Some("main-key"));
+        assert!(is_task);
     }
 }

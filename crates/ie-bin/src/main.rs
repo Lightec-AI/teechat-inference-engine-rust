@@ -24,6 +24,7 @@ use ie_protocol::{AttestedConnectRequest, EngineEphemeralRegisterRequest};
 use ie_runtime::{env_map_from_process, load_engine_env_files, load_engine_plane_client_tls};
 use ie_upstream::{
     embed_model_id_from_env, embeddings_config_from_env, max_tokens_from_env,
+    task_model_id_from_env, vllm_task_config_from_env,
     open_ai_chat_completions_url, VllmChatClient,
 };
 use ope_crypto::{encode, mock_keypair_from_seed, DEV_VECTOR_001_SEED};
@@ -125,6 +126,8 @@ fn print_config(env: &HashMap<String, String>) {
         "TEECHAT_VLLM_BASE_URL",
         "TEECHAT_EMBEDDINGS_UPSTREAM_URL",
         "TEECHAT_EMBED_MODEL",
+        "VLLM_TASK_BASE_URL",
+        "TEECHAT_TASK_MODEL",
         "TEECHAT_BUILD",
         "TEECHAT_ENGINE_SLOT",
         "TEECHAT_ENGINE_STUB",
@@ -170,6 +173,12 @@ fn models_from_env(env: &HashMap<String, String>) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(|s| vec![s.to_string()])
         .unwrap_or_else(|| vec!["google/gemma-4-31B-it".into()]);
+    // Advertise the task model so gateway probes / titles / search prep can route via engine pool.
+    if let Some(task) = task_model_id_from_env(env) {
+        if !models.iter().any(|m| m == &task) {
+            models.push(task);
+        }
+    }
     // Advertise the embeddings model so gateway OPE inventory can route /v1/embeddings.
     if let Some(embed) = embed_model_id_from_env(env) {
         if !models.iter().any(|m| m == &embed) {
@@ -187,6 +196,9 @@ fn clone_inference_options(template: &OpeInferenceOptions) -> OpeInferenceOption
         provider: Arc::clone(&template.provider),
         vllm_base_url: template.vllm_base_url.clone(),
         vllm_api_key: template.vllm_api_key.clone(),
+        task_vllm_base_url: template.task_vllm_base_url.clone(),
+        task_vllm_api_key: template.task_vllm_api_key.clone(),
+        task_model_id: template.task_model_id.clone(),
         embeddings_base_url: template.embeddings_base_url.clone(),
         embeddings_api_key: template.embeddings_api_key.clone(),
         embeddings_default_model: template.embeddings_default_model.clone(),
@@ -537,6 +549,10 @@ async fn run_engine(
             Some((url, key)) => (Some(url), key),
             None => (None, None),
         };
+        let (task_vllm_base_url, task_vllm_api_key) = match vllm_task_config_from_env(env) {
+            Some((url, key)) => (Some(url), key),
+            None => (None, None),
+        };
         let inference_template = OpeInferenceOptions {
             request_id: None,
             decrypt_handle: 0,
@@ -544,6 +560,9 @@ async fn run_engine(
             provider: Arc::clone(&provider),
             vllm_base_url: upstream_base.clone(),
             vllm_api_key: env.get("VLLM_API_KEY").cloned(),
+            task_vllm_base_url,
+            task_vllm_api_key,
+            task_model_id: task_model_id_from_env(env),
             embeddings_base_url,
             embeddings_api_key,
             embeddings_default_model: embed_model_id_from_env(env),
