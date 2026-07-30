@@ -15,6 +15,7 @@ use crate::mock_quote::build_mock_cpu_quote;
 use crate::nv_cc::{build_gpu_not_applicable_evidence, collect_nv_cc_gpu_evidence_b64};
 
 use super::guest_report::{request_sev_snp_attestation_report, should_use_sev_snp_attestation};
+use super::launch_digest::launch_digest_from_report;
 use super::quote::{bind_report_data_64, encode_sev_snp_quote_wrapper, SevSnpQuoteWrapper};
 
 fn env_flag_true(env: &HashMap<String, String>, key: &str) -> bool {
@@ -34,7 +35,15 @@ pub fn build_engine_attestation_bundle(
     let measurements = resolve_binary_measurements_from_env(env, root)?;
     let issued_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let tls_hash = tls_client_cert_sha256.to_ascii_lowercase();
-    let claims = QuoteClaims::from_measurements(ed25519_public, &tls_hash, &measurements, &issued_at);
+    let mut claims =
+        QuoteClaims::from_measurements(ed25519_public, &tls_hash, &measurements, &issued_at);
+    // Dev/CI override only — production path fills from SNP report MEASUREMENT below.
+    if let Some(ld) = env.get("TEECHAT_LAUNCH_DIGEST") {
+        let t = ld.trim().to_ascii_lowercase();
+        if t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+            claims.launch_digest = Some(t);
+        }
+    }
 
     let policy_id = env
         .get("TEECHAT_ATTESTATION_POLICY_ID")
@@ -68,6 +77,9 @@ pub fn build_engine_attestation_bundle(
         nonce,
     );
     let report = request_sev_snp_attestation_report(&report_data, env)?;
+    if let Some(ld) = launch_digest_from_report(&report) {
+        claims.launch_digest = Some(ld);
+    }
     let gpu_nonce = hex::encode(&report_data[..32]);
     let gpu_evidence = collect_nv_cc_gpu_evidence_b64(env, Some(&gpu_nonce))?;
 

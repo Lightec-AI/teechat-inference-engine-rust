@@ -62,6 +62,7 @@ pub fn create_fixture_production_quote_backend(
                 },
                 ope: None,
                 attested_mtls: None,
+                launch_digest: None,
                 issued_at: chrono::Utc::now().to_rfc3339(),
             });
         }

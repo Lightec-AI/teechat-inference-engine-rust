@@ -18,6 +18,9 @@ pub struct QuoteClaims {
     pub ope: Option<OpeWorkloadIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attested_mtls: Option<AttestedMtlsWorkloadIdentity>,
+    /// Challenge-canonical composed SNP launch digest (Wave B).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch_digest: Option<String>,
     pub issued_at: String,
 }
 
@@ -43,6 +46,7 @@ impl QuoteClaims {
             },
             ope: None,
             attested_mtls: None,
+            launch_digest: None,
             issued_at: issued_at.to_string(),
         };
         if let Some(ope) = &measurements.ope {
