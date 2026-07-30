@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use futures::{Stream, StreamExt};
 use reqwest::Client;
@@ -185,6 +186,52 @@ pub fn merge_vllm_thinking_into_body(mut body: Value, enable_thinking: bool) -> 
     body
 }
 
+/// Mutable bag filled from vLLM/OpenAI `usage` (stream trailer or non-stream body).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VllmUsageState {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+}
+
+/// Parse OpenAI-compatible usage (vLLM APC → `prompt_tokens_details.cached_tokens`).
+pub fn parse_vllm_usage(usage: &Value) -> VllmUsageState {
+    if !usage.is_object() {
+        return VllmUsageState::default();
+    }
+    let mut out = VllmUsageState::default();
+    if let Some(n) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+        out.prompt_tokens = Some(n);
+    }
+    if let Some(n) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+        out.completion_tokens = Some(n);
+    }
+    if let Some(details) = usage.get("prompt_tokens_details") {
+        if let Some(n) = details.get("cached_tokens").and_then(|v| v.as_u64()) {
+            out.cached_tokens = Some(n);
+        }
+    }
+    if out.cached_tokens.is_none() {
+        if let Some(n) = usage.get("cached_tokens").and_then(|v| v.as_u64()) {
+            out.cached_tokens = Some(n);
+        }
+    }
+    out
+}
+
+pub fn apply_vllm_usage_state(target: &mut VllmUsageState, usage: &Value) {
+    let parsed = parse_vllm_usage(usage);
+    if parsed.prompt_tokens.is_some() {
+        target.prompt_tokens = parsed.prompt_tokens;
+    }
+    if parsed.completion_tokens.is_some() {
+        target.completion_tokens = parsed.completion_tokens;
+    }
+    if parsed.cached_tokens.is_some() {
+        target.cached_tokens = parsed.cached_tokens;
+    }
+}
+
 pub fn build_vllm_chat_body(opts: &VllmChatBodyOptions<'_>) -> Value {
     let mut body = json!({
         "model": opts.model,
@@ -192,6 +239,9 @@ pub fn build_vllm_chat_body(opts: &VllmChatBodyOptions<'_>) -> Value {
         "stream": opts.stream,
         "max_tokens": opts.max_tokens.unwrap_or(VLLM_MAX_TOKENS_DEFAULT),
     });
+    if opts.stream {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
     if let Some(v) = opts.frequency_penalty {
         body["frequency_penalty"] = json!(clamp_open_ai_penalty(v));
     }
@@ -255,10 +305,18 @@ impl VllmChatClient {
         Self { http }
     }
 
+    /// Stream chat deltas. Second return value is filled from the final usage SSE chunk
+    /// (`stream_options.include_usage`).
     pub async fn stream_chat_completion(
         &self,
         opts: VllmStreamOptions,
-    ) -> Result<impl Stream<Item = Result<String, UpstreamError>> + use<>, UpstreamError> {
+    ) -> Result<
+        (
+            impl Stream<Item = Result<String, UpstreamError>> + use<>,
+            Arc<Mutex<VllmUsageState>>,
+        ),
+        UpstreamError,
+    > {
         let url = open_ai_chat_completions_url(&opts.base_url);
         let mut req = self.http.post(url).json(&build_vllm_chat_body(&VllmChatBodyOptions {
             model: &opts.model,
@@ -288,14 +346,19 @@ impl VllmChatClient {
         let byte_stream = res
             .bytes_stream()
             .map(|chunk| chunk.map_err(UpstreamError::from));
+        let usage = Arc::new(Mutex::new(VllmUsageState::default()));
 
-        Ok(VllmSseStream {
-            byte_stream,
-            buffer: String::new(),
-            pending: std::collections::VecDeque::new(),
-            saw_reasoning: false,
-            reasoning_boundary_emitted: false,
-        })
+        Ok((
+            VllmSseStream {
+                byte_stream,
+                buffer: String::new(),
+                pending: std::collections::VecDeque::new(),
+                saw_reasoning: false,
+                reasoning_boundary_emitted: false,
+                usage: Arc::clone(&usage),
+            },
+            usage,
+        ))
     }
 
     pub async fn complete_chat(&self, opts: VllmCompleteOptions) -> Result<String, UpstreamError> {
@@ -401,6 +464,7 @@ struct VllmSseStream<S> {
     /// True after any reasoning delta; next content gets a TeeChat thinking separator.
     saw_reasoning: bool,
     reasoning_boundary_emitted: bool,
+    usage: Arc<Mutex<VllmUsageState>>,
 }
 
 impl<S> Stream for VllmSseStream<S>
@@ -470,11 +534,17 @@ impl<S> VllmSseStream<S> {
             Some(v) => v,
             None => return Ok(()),
         };
+        if let Some(usage) = chunk.get("usage") {
+            if let Ok(mut state) = self.usage.lock() {
+                apply_vllm_usage_state(&mut state, usage);
+            }
+        }
         let Some(choice) = chunk
             .get("choices")
             .and_then(|c| c.as_array())
             .and_then(|c| c.first())
         else {
+            // Usage-only trailer chunks have empty `choices`.
             return Ok(());
         };
         for delta in stream_deltas_from_vllm_choice(choice) {
@@ -516,6 +586,45 @@ pub fn vllm_config_from_env(env: &HashMap<String, String>) -> Option<(String, Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_body_requests_include_usage() {
+        let body = build_vllm_chat_body(&VllmChatBodyOptions {
+            model: "m",
+            messages: &[],
+            stream: true,
+            max_tokens: Some(256),
+            frequency_penalty: None,
+            presence_penalty: None,
+            temperature: None,
+            top_p: None,
+            enable_thinking: None,
+        });
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn parse_vllm_usage_reads_prompt_tokens_details() {
+        let usage = json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 40,
+            "prompt_tokens_details": { "cached_tokens": 800 }
+        });
+        let parsed = parse_vllm_usage(&usage);
+        assert_eq!(parsed.prompt_tokens, Some(1000));
+        assert_eq!(parsed.completion_tokens, Some(40));
+        assert_eq!(parsed.cached_tokens, Some(800));
+    }
+
+    #[test]
+    fn parse_vllm_usage_falls_back_to_top_level_cached() {
+        let usage = json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "cached_tokens": 7
+        });
+        assert_eq!(parse_vllm_usage(&usage).cached_tokens, Some(7));
+    }
 
     #[test]
     fn chat_completions_url_normalizes_trailing_slash() {

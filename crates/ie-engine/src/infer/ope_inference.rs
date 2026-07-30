@@ -16,7 +16,7 @@ use ie_upstream::{
 use serde_json::{json, Value};
 use tracing::warn;
 
-use crate::ops::{conversation_kv_key, plan_vllm_prefill, ConversationKvState};
+use crate::ops::{conversation_kv_key, plan_vllm_prefill, ConversationKvState, PrefillPlan};
 
 use super::gate::{
     ope_inference_reject_body, validate_ope_inference_envelope, GateResult,
@@ -334,6 +334,7 @@ async fn run_embeddings_inference(
             .unwrap_or_else(|| "engine".into()),
         prompt_tokens: completed.prompt_tokens,
         completion_tokens: 0,
+        cached_tokens: 0,
         ts: chrono::Utc::now().to_rfc3339(),
     };
     let usage_header = match &options.usage_signing_key {
@@ -410,21 +411,24 @@ async fn run_chat_inference(
             .map(|a| a.as_slice())
             .unwrap_or(&[]),
     );
-    let prompt_tokens = estimate_prompt_tokens_from_messages(&messages);
+    let estimated_prompt_tokens = estimate_prompt_tokens_from_messages(&messages);
 
     let hash = {
         use sha2::{Digest, Sha256};
         format!("{:x}", Sha256::digest(conv_id.as_bytes()))
     };
     let kv_key = conversation_kv_key(&conv_id, &model);
-    let cold_suffix = if let Some(kv) = &options.kv {
+    let plan = if let Some(kv) = &options.kv {
         let mut map = kv.lock().expect("kv");
         let prev = map.get(&kv_key).cloned();
-        let (plan, next) = plan_vllm_prefill(prev.as_ref(), prompt_tokens, &hash);
+        let (plan, next) = plan_vllm_prefill(prev.as_ref(), estimated_prompt_tokens, &hash);
         map.insert(kv_key, next);
-        plan.cold_suffix_tokens
+        plan
     } else {
-        prompt_tokens
+        PrefillPlan {
+            warm_prefix_tokens: 0,
+            cold_suffix_tokens: estimated_prompt_tokens,
+        }
     };
 
     let resp = match options.provider.begin_response(decrypt_handle, envelope) {
@@ -480,8 +484,8 @@ async fn run_chat_inference(
         })
         .await;
 
-    let stream = match stream {
-        Ok(s) => s,
+    let (stream, usage_state) = match stream {
+        Ok(pair) => pair,
         Err(e) => {
             options.provider.free_response(resp.session);
             return vllm_upstream_failed_result(&e);
@@ -548,11 +552,26 @@ async fn run_chat_inference(
 
     options.provider.free_response(resp.session);
 
-    let completion_tokens = tokens_from_text(if full_text.is_empty() {
-        "x"
-    } else {
-        &full_text
-    });
+    let usage = usage_state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let completion_tokens = match usage.completion_tokens {
+        Some(n) => n,
+        None => tokens_from_text(if full_text.is_empty() {
+            "x"
+        } else {
+            &full_text
+        }),
+    };
+    let prompt_tokens = match usage.prompt_tokens {
+        Some(n) if n > 0 => n,
+        _ => (plan.warm_prefix_tokens + plan.cold_suffix_tokens).max(1),
+    };
+    let cached_tokens = match usage.cached_tokens {
+        Some(n) => n,
+        None => plan.warm_prefix_tokens,
+    };
     let report = ie_protocol::UsageReport {
         request_id: options
             .request_id
@@ -565,6 +584,7 @@ async fn run_chat_inference(
             .unwrap_or_else(|| "engine".into()),
         prompt_tokens,
         completion_tokens,
+        cached_tokens,
         ts: chrono::Utc::now().to_rfc3339(),
     };
     let usage_header = match &options.usage_signing_key {
@@ -602,7 +622,7 @@ async fn run_chat_inference(
         body: json!({
             "server_share": resp.server_share,
             "chunks": chunks,
-            "engine_prefill_tokens": cold_suffix,
+            "engine_prefill_tokens": plan.cold_suffix_tokens,
         })
         .to_string(),
         usage_header,

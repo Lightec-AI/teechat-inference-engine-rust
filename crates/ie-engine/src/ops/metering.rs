@@ -6,7 +6,9 @@ use ope_crypto::decode;
 use serde_json::json;
 
 pub fn usage_report_signing_bytes(report: &UsageReport) -> Vec<u8> {
+    // Key order must match TS SoT (`metering.ts`) for gateway verify interoperability.
     let canonical = json!({
+        "cached_tokens": report.cached_tokens,
         "completion_tokens": report.completion_tokens,
         "conversation_id": report.conversation_id,
         "engine_id": report.engine_id,
@@ -56,10 +58,36 @@ mod tests {
             engine_id: "e".into(),
             prompt_tokens: 1,
             completion_tokens: 2,
+            cached_tokens: 0,
             ts: "2026-01-01T00:00:00Z".into(),
         };
         let sig = sign_usage_report(&kp.secret, &report);
         let signed = SignedUsageReport { report, sig };
         assert!(verify_usage_report(&pub_b64, &signed));
+    }
+
+    #[test]
+    fn signing_bytes_include_cached_tokens() {
+        let report = UsageReport {
+            request_id: "r".into(),
+            conversation_id: "c".into(),
+            engine_id: "e".into(),
+            prompt_tokens: 1000,
+            completion_tokens: 50,
+            cached_tokens: 800,
+            ts: "2026-01-01T00:00:00Z".into(),
+        };
+        let bytes = usage_report_signing_bytes(&report);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["cached_tokens"], 800);
+        assert_eq!(v["prompt_tokens"], 1000);
+        // Default-zero still present in canonical signing payload.
+        let zero = UsageReport {
+            cached_tokens: 0,
+            ..report
+        };
+        let zero_bytes = usage_report_signing_bytes(&zero);
+        let z: serde_json::Value = serde_json::from_slice(&zero_bytes).unwrap();
+        assert_eq!(z["cached_tokens"], 0);
     }
 }

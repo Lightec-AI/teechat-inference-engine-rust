@@ -1,8 +1,10 @@
 # TeeChat InferenceEngine (Rust)
 
-Rust rewrite of [`@teechat/inference-engine`](https://github.com/Lightec-AI/InferenceEngine) — decrypts OPE envelopes, manages the attested engine-plane pool, calls vLLM, and builds SEV-SNP attestation bundles.
+**Production InferenceEngine train** for TeeChat. Decrypts OPE envelopes, manages the attested engine-plane pool, calls vLLM, and builds SEV-SNP attestation bundles.
 
-**Milestones M1–M7 are Done** (see [`docs/PORTING.md`](docs/PORTING.md)). Wire protocol types should stay aligned with TeaChat’s `@teechat/ope-protocol` (OPE package); this repo keeps a Rust `ie-protocol` mirror.
+The TypeScript repo [`Lightec-AI/InferenceEngine`](https://github.com/Lightec-AI/InferenceEngine) is **archived** — new metering, signing, and runtime work lands here. Wire protocol types stay aligned with TeaChat’s `@teechat/ope-protocol` / OPE `ope-protocol` (Rust SoT); this repo re-exports via `ie-protocol`.
+
+**Milestones M1–M7 are Done** (see [`docs/PORTING.md`](docs/PORTING.md)).
 
 ## Workspace layout
 
