@@ -5,9 +5,7 @@ use std::collections::HashSet;
 use ie_protocol::AttestationBundle;
 
 use crate::fixture::MockCpuQuoteVerifier;
-use crate::policy::{
-    verify_bundle_with_verifier, AttestationPolicy, AttestationVerifyResult,
-};
+use crate::policy::{verify_bundle_with_verifier, AttestationPolicy, AttestationVerifyResult};
 use crate::verify::CpuQuoteVerifier;
 
 /// Platform-side allowlists for gateway + skill-hub binaries (SEC-029).
@@ -53,15 +51,15 @@ pub fn verify_platform_attestation_bundle(
         return fail(&platform_policy.policy_id, "gateway_hash_not_allowed");
     }
     if !platform_policy.allowed_skill_hub_binary_sha256.is_empty()
-        && !platform_policy.allowed_skill_hub_binary_sha256.contains(&sh)
+        && !platform_policy
+            .allowed_skill_hub_binary_sha256
+            .contains(&sh)
     {
         return fail(&platform_policy.policy_id, "skill_hub_hash_not_allowed");
     }
 
     let mut quote_policy = engine_policy.clone();
-    quote_policy
-        .allowed_engine_binary_sha256
-        .insert(gw.clone());
+    quote_policy.allowed_engine_binary_sha256.insert(gw.clone());
     quote_policy.allowed_vllm_binary_sha256.insert(sh.clone());
     if quote_policy.max_quote_age_ms == 0 {
         quote_policy.max_quote_age_ms = platform_policy.max_quote_age_ms;
@@ -150,6 +148,7 @@ mod tests {
             ope: None,
             attested_mtls: None,
             launch_digest: None,
+            epoch: None,
             issued_at: chrono::Utc::now().to_rfc3339(),
         };
         let quote = build_mock_cpu_quote(&claims);
@@ -189,13 +188,8 @@ mod tests {
             ed25519_public: ed.into(),
         };
         let now = chrono::Utc::now().timestamp_millis() as u64;
-        let v = verify_platform_attestation_bundle_mock(
-            &bundle,
-            &engine_policy,
-            &platform,
-            &bind,
-            now,
-        );
+        let v =
+            verify_platform_attestation_bundle_mock(&bundle, &engine_policy, &platform, &bind, now);
         assert!(v.ok, "{v:?}");
     }
 
@@ -216,13 +210,8 @@ mod tests {
             ed25519_public: ed.into(),
         };
         let now = chrono::Utc::now().timestamp_millis() as u64;
-        let v = verify_platform_attestation_bundle_mock(
-            &bundle,
-            &engine_policy,
-            &platform,
-            &bind,
-            now,
-        );
+        let v =
+            verify_platform_attestation_bundle_mock(&bundle, &engine_policy, &platform, &bind, now);
         assert!(!v.ok);
         assert_eq!(v.reason.as_deref(), Some("gateway_hash_not_allowed"));
     }

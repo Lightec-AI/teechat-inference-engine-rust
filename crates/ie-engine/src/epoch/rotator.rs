@@ -11,7 +11,9 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
-use super::engine_epoch::{create_engine_epoch, CreateEngineEpochArgs, EngineEpoch};
+use super::engine_epoch::{
+    create_engine_epoch, CreateEngineEpochArgs, EngineEpoch, EpochEvidenceMinter,
+};
 use super::policy::{
     compute_epoch_rotate_at_ms, epoch_rotation_lead_ms_from_env, epoch_rotation_policy_from_env,
     epoch_ttl_ms_from_policy, EpochRotationPolicy,
@@ -45,6 +47,7 @@ pub struct EpochRotator {
     list_sessions: Arc<dyn Fn() -> Vec<EpochRotatorSession> + Send + Sync>,
     poster: Arc<dyn EphemeralPoster>,
     attestation: RwLock<Option<AttestationBundle>>,
+    mint_epoch_evidence: Option<EpochEvidenceMinter>,
     current: RwLock<EngineEpoch>,
     rotating: Mutex<bool>,
     stopped: RwLock<bool>,
@@ -52,21 +55,34 @@ pub struct EpochRotator {
     on_epoch_rotated: Option<EpochRotatedCallback>,
 }
 
+pub struct EpochRotatorOptions<'a> {
+    pub engine_id: String,
+    pub ed25519_public_b64: String,
+    pub signing_key: SigningKey,
+    pub provider: Arc<dyn CryptoProvider>,
+    /// Connect-time bundle, used only when no per-epoch evidence can be minted.
+    pub attestation: Option<AttestationBundle>,
+    pub mint_epoch_evidence: Option<EpochEvidenceMinter>,
+    pub env: &'a HashMap<String, String>,
+    pub list_sessions: Arc<dyn Fn() -> Vec<EpochRotatorSession> + Send + Sync>,
+    pub poster: Arc<dyn EphemeralPoster>,
+    pub on_epoch_rotated: Option<EpochRotatedCallback>,
+}
+
 impl EpochRotator {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        engine_id: impl Into<String>,
-        ed25519_public_b64: impl Into<String>,
-        signing_key: SigningKey,
-        provider: Arc<dyn CryptoProvider>,
-        attestation: Option<AttestationBundle>,
-        env: &HashMap<String, String>,
-        list_sessions: Arc<dyn Fn() -> Vec<EpochRotatorSession> + Send + Sync>,
-        poster: Arc<dyn EphemeralPoster>,
-        on_epoch_rotated: Option<EpochRotatedCallback>,
-    ) -> Result<Self, EngineError> {
-        let engine_id = engine_id.into();
-        let ed25519_public_b64 = ed25519_public_b64.into();
+    pub fn new(opts: EpochRotatorOptions<'_>) -> Result<Self, EngineError> {
+        let EpochRotatorOptions {
+            engine_id,
+            ed25519_public_b64,
+            signing_key,
+            provider,
+            attestation,
+            mint_epoch_evidence,
+            env,
+            list_sessions,
+            poster,
+            on_epoch_rotated,
+        } = opts;
         let policy = epoch_rotation_policy_from_env(env);
         let lead_ms = epoch_rotation_lead_ms_from_env(env);
         let ttl_ms = epoch_ttl_ms_from_policy(&policy);
@@ -75,6 +91,7 @@ impl EpochRotator {
             ed25519_public_b64: &ed25519_public_b64,
             signing_key: &signing_key,
             attestation: attestation.clone(),
+            mint_epoch_evidence: mint_epoch_evidence.clone(),
             epoch_id: None,
             ttl_ms: Some(ttl_ms),
             provider: Arc::clone(&provider),
@@ -90,6 +107,7 @@ impl EpochRotator {
             list_sessions,
             poster,
             attestation: RwLock::new(attestation),
+            mint_epoch_evidence,
             current: RwLock::new(current),
             rotating: Mutex::new(false),
             stopped: RwLock::new(false),
@@ -207,6 +225,7 @@ impl EpochRotator {
             ed25519_public_b64: &self.ed25519_public_b64,
             signing_key: &self.signing_key,
             attestation,
+            mint_epoch_evidence: self.mint_epoch_evidence.clone(),
             epoch_id: None,
             ttl_ms: Some(self.ttl_ms),
             provider: Arc::clone(&self.provider),
@@ -227,6 +246,7 @@ impl EpochRotator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ie_attestation::QuoteEpochClaims;
     use ie_crypto::MockCryptoProvider;
     use ope_crypto::{mock_keypair_from_seed, DEV_VECTOR_001_SEED};
 
@@ -249,21 +269,73 @@ mod tests {
         let kp = mock_keypair_from_seed(&DEV_VECTOR_001_SEED);
         let pub_b64 = ope_crypto::encode(kp.public.to_bytes().as_slice());
         let rotator = Arc::new(
-            EpochRotator::new(
-                "eng",
-                pub_b64,
-                kp.secret,
+            EpochRotator::new(EpochRotatorOptions {
+                engine_id: "eng".into(),
+                ed25519_public_b64: pub_b64,
+                signing_key: kp.secret,
                 provider,
-                None,
-                &HashMap::new(),
-                Arc::new(|| vec![EpochRotatorSession {
-                    session_id: "s1".into(),
-                }]),
-                Arc::new(OkPoster),
-                None,
-            )
+                attestation: None,
+                mint_epoch_evidence: None,
+                env: &HashMap::new(),
+                list_sessions: Arc::new(|| {
+                    vec![EpochRotatorSession {
+                        session_id: "s1".into(),
+                    }]
+                }),
+                poster: Arc::new(OkPoster),
+                on_epoch_rotated: None,
+            })
             .unwrap(),
         );
         rotator.register_initial_epoch().await.unwrap();
+    }
+
+    /// Reusing the boot bundle would leave every epoch after the first vouched
+    /// for only by the boot identity's signature (RB-45).
+    #[tokio::test]
+    async fn each_rotation_mints_evidence_for_its_own_epoch() {
+        let provider = Arc::new(MockCryptoProvider::new());
+        let kp = mock_keypair_from_seed(&DEV_VECTOR_001_SEED);
+        let pub_b64 = ope_crypto::encode(kp.public.to_bytes().as_slice());
+        let minted: Arc<std::sync::Mutex<Vec<QuoteEpochClaims>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&minted);
+
+        let rotator = Arc::new(
+            EpochRotator::new(EpochRotatorOptions {
+                engine_id: "eng".into(),
+                ed25519_public_b64: pub_b64.clone(),
+                signing_key: kp.secret.clone(),
+                provider,
+                attestation: None,
+                mint_epoch_evidence: Some(Arc::new(move |claims: &QuoteEpochClaims| {
+                    seen.lock().expect("minted").push(claims.clone());
+                    None
+                })),
+                env: &HashMap::new(),
+                list_sessions: Arc::new(|| {
+                    vec![EpochRotatorSession {
+                        session_id: "s1".into(),
+                    }]
+                }),
+                poster: Arc::new(OkPoster),
+                on_epoch_rotated: None,
+            })
+            .unwrap(),
+        );
+
+        let first = rotator.current_epoch();
+        rotator.rotate_now().await.unwrap();
+        let second = rotator.current_epoch();
+
+        let minted = minted.lock().expect("minted");
+        assert_eq!(minted.len(), 2, "one mint per epoch, boot included");
+        assert_eq!(minted[0].epoch_id, first.epoch_id);
+        assert_eq!(minted[1].epoch_id, second.epoch_id);
+        assert_ne!(first.epoch_id, second.epoch_id);
+        assert_ne!(
+            minted[0].usage_signing_public,
+            minted[1].usage_signing_public
+        );
     }
 }

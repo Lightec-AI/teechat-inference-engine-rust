@@ -7,25 +7,27 @@ use async_trait::async_trait;
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 use ie_attestation::{
-    build_engine_attestation_bundle, create_engine_attestation_refresher, load_tcb_pins,
-    validate_tcb_pins, EngineAttestationRefreshContext,
+    build_engine_attestation_bundle, build_engine_epoch_attestation_bundle,
+    create_engine_attestation_refresher, load_tcb_pins, validate_tcb_pins,
+    EngineAttestationRefreshContext, QuoteEpochClaims,
 };
 use ie_crypto::{MockCryptoProvider, RealCryptoProvider};
 use ie_engine::{
-    configure_event_log_from_env, create_pool_connect_throttle_from_env, engine_instance_id_from_env,
-    epoch_rotation_policy_from_env, generate_gateway_connect_challenge_nonce, install_engine_controls,
+    configure_event_log_from_env, create_pool_connect_throttle_from_env,
+    engine_instance_id_from_env, epoch_rotation_policy_from_env,
+    generate_gateway_connect_challenge_nonce, install_engine_controls,
     platform_policy_verifier_from_env, spawn_desired_pool_applier, start_pull_worker,
-    warn_pull_worker_start,
-    DesiredPoolTargetCallback, EnginePlaneDialOptions, EphemeralPoster, EpochRotatedCallback,
-    EpochRotator, EpochRotatorSession, Http2EnginePlaneConnector, OpeInferenceOptions,
-    PullWorkerStartFn, RotatingEpochDecryptor, SupervisedPool, SupervisedPoolConfig,
+    warn_pull_worker_start, DesiredPoolTargetCallback, EnginePlaneDialOptions, EphemeralPoster,
+    EpochEvidenceMinter, EpochRotatedCallback, EpochRotator, EpochRotatorOptions,
+    EpochRotatorSession, Http2EnginePlaneConnector, OpeInferenceOptions, PullWorkerStartFn,
+    RotatingEpochDecryptor, SupervisedPool, SupervisedPoolConfig,
 };
 use ie_protocol::{AttestedConnectRequest, EngineEphemeralRegisterRequest};
 use ie_runtime::{env_map_from_process, load_engine_env_files, load_engine_plane_client_tls};
 use ie_upstream::{
     embed_model_id_from_env, embeddings_config_from_env, max_tokens_from_env,
-    task_model_id_from_env, vllm_task_config_from_env,
-    open_ai_chat_completions_url, VllmChatClient,
+    open_ai_chat_completions_url, task_model_id_from_env, vllm_task_config_from_env,
+    VllmChatClient,
 };
 use ope_crypto::{encode, mock_keypair_from_seed, DEV_VECTOR_001_SEED};
 use rand::rngs::OsRng;
@@ -371,10 +373,7 @@ async fn run_engine(
 
     let (signing_key, ed25519_public_b64) = if force_stub {
         let kp = mock_keypair_from_seed(&DEV_VECTOR_001_SEED);
-        (
-            kp.secret.clone(),
-            encode(kp.public.to_bytes().as_slice()),
-        )
+        (kp.secret.clone(), encode(kp.public.to_bytes().as_slice()))
     } else {
         let signing_key = SigningKey::generate(&mut OsRng);
         let ed25519_public_b64 = encode(signing_key.verifying_key().as_bytes());
@@ -463,16 +462,8 @@ async fn run_engine(
     pool_config.pool_target_size = pool_target_size;
 
     let pool = Arc::new(
-        SupervisedPool::new(
-            pool_config.clone(),
-            gateway.clone(),
-            connector,
-            upstream,
-        )
-        .with_connect_throttle(create_pool_connect_throttle_from_env(
-            env,
-            pool_target_size,
-        )),
+        SupervisedPool::new(pool_config.clone(), gateway.clone(), connector, upstream)
+            .with_connect_throttle(create_pool_connect_throttle_from_env(env, pool_target_size)),
     );
 
     let live_sessions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -512,17 +503,48 @@ async fn run_engine(
             }
         });
 
-        let rotator = Arc::new(EpochRotator::new(
-            engine_id.clone(),
-            ed25519_public_b64.clone(),
-            signing_key.clone(),
-            Arc::clone(&provider),
-            Some(attestation),
+        // Every epoch gets its own hardware report over its own keys. When the
+        // platform cannot produce one, the rotator falls back to the connect
+        // bundle so a mock/dev boot still comes up (RB-45).
+        let mint_epoch_evidence: EpochEvidenceMinter = {
+            let ed25519_public = ed25519_public_b64.clone();
+            let tls_cert_sha = tls_cert_sha.clone();
+            let root = PathBuf::from(cwd);
+            let env = env.clone();
+            Arc::new(move |claims: &QuoteEpochClaims| {
+                match build_engine_epoch_attestation_bundle(
+                    &env,
+                    &root,
+                    &ed25519_public,
+                    &tls_cert_sha,
+                    claims,
+                    None,
+                ) {
+                    Ok(bundle) => Some(bundle),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            epoch_id = %claims.epoch_id,
+                            "per-epoch attestation unavailable; falling back to connect evidence"
+                        );
+                        None
+                    }
+                }
+            })
+        };
+
+        let rotator = Arc::new(EpochRotator::new(EpochRotatorOptions {
+            engine_id: engine_id.clone(),
+            ed25519_public_b64: ed25519_public_b64.clone(),
+            signing_key: signing_key.clone(),
+            provider: Arc::clone(&provider),
+            attestation: Some(attestation),
+            mint_epoch_evidence: Some(mint_epoch_evidence),
             env,
             list_sessions,
             poster,
-            Some(on_rotated),
-        )?);
+            on_epoch_rotated: Some(on_rotated),
+        })?);
         let decryptor = Arc::new(RotatingEpochDecryptor::new(
             rotator.current_epoch(),
             epoch_rotation_policy_from_env(env).overlap_grace_ms,

@@ -37,7 +37,9 @@ impl RotatingEpochDecryptor {
     pub fn handle(&self) -> Result<u64, EngineError> {
         let current = self.current_epoch_id.read().expect("epoch id");
         let epochs = self.epochs.read().expect("epochs");
-        let id = current.as_ref().ok_or_else(|| EngineError::Epoch("no current epoch".into()))?;
+        let id = current
+            .as_ref()
+            .ok_or_else(|| EngineError::Epoch("no current epoch".into()))?;
         let epoch = epochs
             .get(id)
             .ok_or_else(|| EngineError::Epoch(format!("missing epoch {id}")))?;
@@ -46,8 +48,9 @@ impl RotatingEpochDecryptor {
             .ok_or_else(|| EngineError::Epoch("current epoch has no native decrypt handle".into()))
     }
 
-    pub fn resolve_handle(&self, envelope: &OpeEnvelope) -> Result<u64, EngineError> {
-        let epoch_id = envelope
+    /// The epoch a request belongs to: the one it names, else the current one.
+    fn requested_epoch_id(&self, envelope: &OpeEnvelope) -> Option<String> {
+        envelope
             .e2e
             .as_ref()
             .and_then(|e2e| {
@@ -57,33 +60,51 @@ impl RotatingEpochDecryptor {
                     Some(e2e.ephemeral_epoch.clone())
                 }
             })
-            .or_else(|| self.current_epoch_id.read().expect("epoch id").clone());
+            .or_else(|| self.current_epoch_id.read().expect("epoch id").clone())
+    }
+
+    pub fn resolve_handle(&self, envelope: &OpeEnvelope) -> Result<u64, EngineError> {
+        let epoch_id = self.requested_epoch_id(envelope);
 
         let epochs = self.epochs.read().expect("epochs");
-        let target = epoch_id
-            .as_ref()
-            .and_then(|id| epochs.get(id))
-            .or_else(|| {
-                self.current_epoch_id
-                    .read()
-                    .expect("epoch id")
-                    .as_ref()
-                    .and_then(|id| epochs.get(id))
-            });
+        let target = epoch_id.as_ref().and_then(|id| epochs.get(id)).or_else(|| {
+            self.current_epoch_id
+                .read()
+                .expect("epoch id")
+                .as_ref()
+                .and_then(|id| epochs.get(id))
+        });
 
-        target
-            .and_then(|e| e.handle)
-            .ok_or_else(|| {
-                EngineError::Epoch(format!(
-                    "no decrypt handle for epoch {}",
-                    epoch_id.unwrap_or_else(|| "current".into())
-                ))
-            })
+        target.and_then(|e| e.handle).ok_or_else(|| {
+            EngineError::Epoch(format!(
+                "no decrypt handle for epoch {}",
+                epoch_id.unwrap_or_else(|| "current".into())
+            ))
+        })
+    }
+
+    /// Usage-signing key of the epoch that served this request.
+    ///
+    /// Metering has to be signed by the same epoch the gateway attested, not by
+    /// a process-lifetime key, so that a retired epoch cannot keep vouching for
+    /// billing after it stops being decrypt-capable (RB-52).
+    pub fn resolve_usage_signing_key(
+        &self,
+        envelope: &OpeEnvelope,
+    ) -> Option<Arc<ed25519_dalek::SigningKey>> {
+        let epoch_id = self.requested_epoch_id(envelope)?;
+        let epochs = self.epochs.read().expect("epochs");
+        epochs
+            .get(&epoch_id)
+            .map(|epoch| Arc::clone(&epoch.usage_signing_key))
     }
 
     pub fn add_epoch(&self, epoch: EngineEpoch) {
         let id = epoch.epoch_id.clone();
-        self.epochs.write().expect("epochs").insert(id.clone(), epoch);
+        self.epochs
+            .write()
+            .expect("epochs")
+            .insert(id.clone(), epoch);
         *self.current_epoch_id.write().expect("epoch id") = Some(id);
     }
 
@@ -135,6 +156,7 @@ mod tests {
             ed25519_public_b64: &pub_b64,
             signing_key: &kp.secret,
             attestation: None,
+            mint_epoch_evidence: None,
             epoch_id: Some(id.into()),
             ttl_ms: Some(ttl_ms),
             provider,

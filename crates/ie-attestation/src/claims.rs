@@ -5,6 +5,23 @@ use ie_protocol::{
     CpuTeeKind, GpuTeeAttestation, GpuTeeKind, OpeWorkloadIdentity, WorkloadMeasurements,
 };
 
+/// The epoch key material an attestation report vouches for (bind v2).
+///
+/// Connect-scoped evidence only covers the boot identity, which leaves every
+/// epoch minted afterwards resting on a software signature by that identity.
+/// Naming the epoch's own keys inside the report is what removes that gap
+/// (RB-45); the receiver-side match lives in `epoch_evidence`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuoteEpochClaims {
+    pub engine_id: String,
+    pub epoch_id: String,
+    pub not_before: String,
+    pub not_after: String,
+    pub mlkem_encapsulation_key: String,
+    pub x25519_public: String,
+    pub usage_signing_public: String,
+}
+
 /// Normalized claims extracted from a CPU TEE quote (port of `attestation.ts` `QuoteClaims`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuoteClaims {
@@ -21,6 +38,9 @@ pub struct QuoteClaims {
     /// Challenge-canonical composed SNP launch digest (Wave B).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch_digest: Option<String>,
+    /// Present on per-epoch (bind v2) evidence; absent on connect-scoped evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<QuoteEpochClaims>,
     pub issued_at: String,
 }
 
@@ -47,6 +67,7 @@ impl QuoteClaims {
             ope: None,
             attested_mtls: None,
             launch_digest: None,
+            epoch: None,
             issued_at: issued_at.to_string(),
         };
         if let Some(ope) = &measurements.ope {

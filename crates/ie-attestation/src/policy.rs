@@ -20,12 +20,12 @@ pub struct AttestationPolicy {
 pub fn default_test_attestation_policy() -> AttestationPolicy {
     AttestationPolicy {
         policy_id: "teechat-cpu-tee-v1".into(),
-        allowed_engine_binary_sha256: HashSet::from([(
-            "a1b2c3d4e5f6789012345678abcdef9012345678abcdef9012345678abcdef90".into()
-        )]),
-        allowed_vllm_binary_sha256: HashSet::from([(
-            "b2c3d4e5f6789012345678abcdef9012345678abcdef9012345678abcdef9012".into()
-        )]),
+        allowed_engine_binary_sha256: HashSet::from([
+            ("a1b2c3d4e5f6789012345678abcdef9012345678abcdef9012345678abcdef90".into()),
+        ]),
+        allowed_vllm_binary_sha256: HashSet::from([
+            ("b2c3d4e5f6789012345678abcdef9012345678abcdef9012345678abcdef9012".into()),
+        ]),
         max_quote_age_ms: 24 * 60 * 60 * 1000,
         gpu: GpuAttestationPolicy {
             require_gpu_attestation: false,
@@ -123,9 +123,14 @@ mod tests {
             ope: None,
             attested_mtls: None,
             launch_digest: None,
+            epoch: None,
             issued_at: chrono::Utc::now().to_rfc3339(),
         };
-        let result = verify_claims_against_policy(&claims, &policy, chrono::Utc::now().timestamp_millis() as u64);
+        let result = verify_claims_against_policy(
+            &claims,
+            &policy,
+            chrono::Utc::now().timestamp_millis() as u64,
+        );
         assert!(result.ok);
     }
 }

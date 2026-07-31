@@ -59,6 +59,7 @@ mod tests {
             ope: None,
             attested_mtls: None,
             launch_digest: None,
+            epoch: None,
             issued_at: "2026-01-01T00:00:00Z".into(),
         };
         let quote = build_mock_cpu_quote(&payload);

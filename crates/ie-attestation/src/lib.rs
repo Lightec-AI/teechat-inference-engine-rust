@@ -2,6 +2,7 @@
 
 mod bundle;
 mod claims;
+mod epoch_evidence;
 mod error;
 mod fixture;
 mod measurements;
@@ -15,7 +16,10 @@ mod tcb_pins;
 mod verify;
 
 pub use bundle::{build_attestation_bundle_from_measurements, BuildAttestationBundleArgs};
-pub use claims::QuoteClaims;
+pub use claims::{QuoteClaims, QuoteEpochClaims};
+pub use epoch_evidence::{
+    has_epoch_evidence, match_epoch_evidence, EpochEvidenceError, EpochEvidenceSubject,
+};
 pub use error::AttestationError;
 pub use fixture::{
     clear_production_quote_backend, create_fixture_production_quote_backend,
@@ -28,10 +32,10 @@ pub use measurements::{
 };
 pub use mock_quote::{build_mock_cpu_quote, parse_mock_cpu_quote};
 pub use nv_cc::{
-    build_gpu_not_applicable_evidence, collect_nv_cc_gpu_evidence_b64, default_gpu_attestation_policy,
-    encode_legacy_mock_gpu_evidence, nvattest_bin_from_env, resolve_nvattest_bin,
-    validate_nv_gpu_claims_against_policy, verify_mock_nv_cc_gpu_evidence, verify_nv_cc_gpu_evidence,
-    GpuAttestationPolicy, GpuEvidenceVerifyResult,
+    build_gpu_not_applicable_evidence, collect_nv_cc_gpu_evidence_b64,
+    default_gpu_attestation_policy, encode_legacy_mock_gpu_evidence, nvattest_bin_from_env,
+    resolve_nvattest_bin, validate_nv_gpu_claims_against_policy, verify_mock_nv_cc_gpu_evidence,
+    verify_nv_cc_gpu_evidence, GpuAttestationPolicy, GpuEvidenceVerifyResult,
 };
 pub use platform::{
     verify_platform_attestation_bundle, verify_platform_attestation_bundle_mock,
@@ -42,10 +46,12 @@ pub use policy::{
     AttestationPolicy, AttestationVerifyResult,
 };
 pub use refresh::{
-    create_engine_attestation_refresher, EngineAttestationRefreshContext, EngineAttestationRefresher,
+    create_engine_attestation_refresher, EngineAttestationRefreshContext,
+    EngineAttestationRefresher,
 };
 pub use sev_snp::{
-    bind_report_data_64, build_engine_attestation_bundle, challenge_canonical_launch_digest,
+    bind_epoch_report_data_64, bind_report_data_64, build_engine_attestation_bundle,
+    build_engine_epoch_attestation_bundle, challenge_canonical_launch_digest,
     encode_sev_snp_quote_wrapper, extract_measurement_from_report, extract_report_data_from_report,
     is_sev_snp_guest_device_available, launch_digest_from_report, parse_sev_snp_quote_wrapper,
     request_sev_snp_attestation_report, should_use_sev_snp_attestation,

@@ -18,9 +18,7 @@ use tracing::warn;
 
 use crate::ops::{conversation_kv_key, plan_vllm_prefill, ConversationKvState, PrefillPlan};
 
-use super::gate::{
-    ope_inference_reject_body, validate_ope_inference_envelope, GateResult,
-};
+use super::gate::{ope_inference_reject_body, validate_ope_inference_envelope, GateResult};
 
 /// Optional NDJSON sink (OPE §7). Prefer a byte buffer to keep borrow checker happy.
 pub trait NdjsonStreamWriter: Send {
@@ -67,12 +65,25 @@ fn resolve_decrypt_handle(
     envelope: &OpeEnvelope,
 ) -> Result<u64, String> {
     if let Some(rotating) = &options.rotating {
-        rotating
-            .resolve_handle(envelope)
-            .map_err(|e| e.to_string())
+        rotating.resolve_handle(envelope).map_err(|e| e.to_string())
     } else {
         Ok(options.decrypt_handle)
     }
+}
+
+/// Usage reports are signed by the epoch that served the request, so the
+/// gateway can check them against the key the same epoch's evidence attested
+/// (RB-52). `usage_signing_key` remains for single-epoch test setups.
+fn resolve_usage_signing_key(
+    options: &OpeInferenceOptions,
+    envelope: &OpeEnvelope,
+) -> Option<ed25519_dalek::SigningKey> {
+    if let Some(rotating) = &options.rotating {
+        if let Some(key) = rotating.resolve_usage_signing_key(envelope) {
+            return Some((*key).clone());
+        }
+    }
+    options.usage_signing_key.clone()
 }
 
 #[derive(Debug, Clone)]
@@ -197,14 +208,8 @@ pub async fn run_ope_inference_on_envelope(
                 usage_header: None,
             };
         };
-        return run_embeddings_inference(
-            envelope,
-            &payload,
-            options,
-            base_url,
-            &mut ndjson_out,
-        )
-        .await;
+        return run_embeddings_inference(envelope, &payload, options, base_url, &mut ndjson_out)
+            .await;
     }
 
     if options.vllm_base_url.trim().is_empty() {
@@ -303,7 +308,8 @@ async fn run_embeddings_inference(
 
     let streaming = ndjson_out.is_some();
     if let Some(out) = ndjson_out.as_mut() {
-        if let Ok(line) = encode_ope_stream_line(&OpeStreamFrame::server_share(&resp.server_share)) {
+        if let Ok(line) = encode_ope_stream_line(&OpeStreamFrame::server_share(&resp.server_share))
+        {
             out.write(&line);
         }
     }
@@ -337,12 +343,14 @@ async fn run_embeddings_inference(
         cached_tokens: 0,
         ts: chrono::Utc::now().to_rfc3339(),
     };
-    let usage_header = match &options.usage_signing_key {
+    let usage_header = match resolve_usage_signing_key(options, envelope) {
         Some(key) => {
-            let sig = crate::ops::sign_usage_report(key, &report);
+            let sig = crate::ops::sign_usage_report(&key, &report);
             let signed = ie_protocol::SignedUsageReport { report, sig };
             Some(ope_crypto::encode(
-                serde_json::to_string(&signed).unwrap_or_default().as_bytes(),
+                serde_json::to_string(&signed)
+                    .unwrap_or_default()
+                    .as_bytes(),
             ))
         }
         None => {
@@ -353,7 +361,8 @@ async fn run_embeddings_inference(
 
     if streaming {
         if let Some(out) = ndjson_out.as_mut() {
-            if let Ok(line) = encode_ope_stream_line(&OpeStreamFrame::trailer(usage_header.clone())) {
+            if let Ok(line) = encode_ope_stream_line(&OpeStreamFrame::trailer(usage_header.clone()))
+            {
                 out.write(&line);
             }
             out.end();
@@ -494,7 +503,8 @@ async fn run_chat_inference(
 
     // vLLM accepted the request — now it is safe to start the OPE ciphertext stream.
     if let Some(out) = ndjson_out.as_mut() {
-        if let Ok(line) = encode_ope_stream_line(&OpeStreamFrame::server_share(&resp.server_share)) {
+        if let Ok(line) = encode_ope_stream_line(&OpeStreamFrame::server_share(&resp.server_share))
+        {
             out.write(&line);
         }
     }
@@ -587,12 +597,14 @@ async fn run_chat_inference(
         cached_tokens,
         ts: chrono::Utc::now().to_rfc3339(),
     };
-    let usage_header = match &options.usage_signing_key {
+    let usage_header = match resolve_usage_signing_key(options, envelope) {
         Some(key) => {
-            let sig = crate::ops::sign_usage_report(key, &report);
+            let sig = crate::ops::sign_usage_report(&key, &report);
             let signed = ie_protocol::SignedUsageReport { report, sig };
             Some(ope_crypto::encode(
-                serde_json::to_string(&signed).unwrap_or_default().as_bytes(),
+                serde_json::to_string(&signed)
+                    .unwrap_or_default()
+                    .as_bytes(),
             ))
         }
         None => {
@@ -603,7 +615,8 @@ async fn run_chat_inference(
 
     if streaming {
         if let Some(out) = ndjson_out.as_mut() {
-            if let Ok(line) = encode_ope_stream_line(&OpeStreamFrame::trailer(usage_header.clone())) {
+            if let Ok(line) = encode_ope_stream_line(&OpeStreamFrame::trailer(usage_header.clone()))
+            {
                 out.write(&line);
             }
             out.end();
