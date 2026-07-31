@@ -23,7 +23,7 @@ use ie_engine::{
     RotatingEpochDecryptor, SupervisedPool, SupervisedPoolConfig,
 };
 use ie_protocol::{AttestedConnectRequest, EngineEphemeralRegisterRequest};
-use ie_runtime::{env_map_from_process, load_engine_env_files, load_engine_plane_client_tls};
+use ie_runtime::{engine_plane_client_tls, env_map_from_process, load_engine_env_files};
 use ie_upstream::{
     embed_model_id_from_env, embeddings_config_from_env, max_tokens_from_env,
     open_ai_chat_completions_url, task_model_id_from_env, vllm_task_config_from_env,
@@ -380,14 +380,20 @@ async fn run_engine(
         (signing_key, ed25519_public_b64)
     };
 
-    let tls_cert_sha = if force_stub {
-        "0".repeat(64)
+    // Minted once and reused below. The digest goes into REPORT_DATA and the
+    // gateway checks it against the certificate this process actually presents,
+    // so a second call here would mint a second key and break that binding.
+    let engine_plane_tls = if force_stub {
+        None
     } else {
-        load_engine_plane_client_tls(env)
-            .map_err(|e| {
-                format!("TLS material required for live H2 (or set TEECHAT_ENGINE_STUB=1): {e}")
-            })?
-            .client_cert_sha256
+        Some(engine_plane_client_tls(env, &engine_id).map_err(|e| {
+            format!("TLS material required for live H2 (or set TEECHAT_ENGINE_STUB=1): {e}")
+        })?)
+    };
+
+    let tls_cert_sha = match &engine_plane_tls {
+        Some(tls) => tls.client_cert_sha256.clone(),
+        None => "0".repeat(64),
     };
 
     let attestation = build_engine_attestation_bundle(
@@ -428,9 +434,9 @@ async fn run_engine(
             None,
         )
     } else {
-        let tls = load_engine_plane_client_tls(env).map_err(|e| {
-            format!("TLS material required for live H2 (or set TEECHAT_ENGINE_STUB=1): {e}")
-        })?;
+        let tls = engine_plane_tls
+            .clone()
+            .ok_or_else(|| "TLS material required for live H2".to_string())?;
         let verifier: Option<Arc<dyn ie_engine::GatewayAttestationVerifier>> =
             if verify_gateway_platform_enabled(env) {
                 Some(Arc::new(platform_policy_verifier_from_env(env)))

@@ -40,6 +40,7 @@ rustls-pemfile = "2"
 uuid = { version = "1", features = ["v4"] }
 url = "2"
 rand = "0.8"
+rcgen = "0.13"
 attested-mtls = "0.1.0"
 ope-crypto = "0.1.0"
 ope-envelope = "0.1.0"

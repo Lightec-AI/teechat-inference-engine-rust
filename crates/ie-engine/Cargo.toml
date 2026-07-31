@@ -41,7 +41,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 ope-e2e = { workspace = true }
 ope-envelope = { workspace = true }
-rcgen = "0.13"
+rcgen = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 wiremock = "0.6"
