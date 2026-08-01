@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use chrono::{Duration, Utc};
+use chrono::{Duration, SecondsFormat, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use ie_attestation::QuoteEpochClaims;
 use ie_crypto::{CryptoProvider, EngineHybridKeypair};
@@ -58,9 +58,14 @@ fn generate_usage_signing_key() -> SigningKey {
 pub fn create_engine_epoch(args: CreateEngineEpochArgs<'_>) -> Result<EngineEpoch, EngineError> {
     let now = Utc::now();
     let now_ms = now.timestamp_millis() as u64;
-    let not_before = now.to_rfc3339();
+    // Millis + Z — same shape as `issued_at` in the SNP wrapper. chrono's
+    // default `to_rfc3339()` emits `+00:00` with nanoseconds; those strings are
+    // what go into REPORT_DATA bind-v2, so any later rewrite to Z-millis
+    // (gateway "edge compatibility") silently breaks client verification.
+    let not_before = now.to_rfc3339_opts(SecondsFormat::Millis, true);
     let ttl = args.ttl_ms.unwrap_or(86_400_000);
-    let not_after = (now + Duration::milliseconds(ttl as i64)).to_rfc3339();
+    let not_after = (now + Duration::milliseconds(ttl as i64))
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
     // Millisecond granularity alone collides when two epochs are minted in the
     // same tick, and a gateway that holds one epoch id to one set of keys
     // rejects the second one (RB-42).
@@ -167,5 +172,18 @@ mod tests {
         assert_eq!(epoch.epoch_id, "epoch-a");
         assert_eq!(epoch.ephemeral_request.engine_id, "eng");
         assert!(epoch.handle.is_none());
+        // Bind-v2 hashes these strings verbatim; keep them Z-millis like issued_at.
+        assert!(
+            epoch.not_before.ends_with('Z'),
+            "not_before must be Z-millis, got {}",
+            epoch.not_before
+        );
+        assert!(
+            !epoch.not_before.contains('+'),
+            "not_before must not use +00:00 form, got {}",
+            epoch.not_before
+        );
+        assert_eq!(epoch.not_before, epoch.ephemeral_request.not_before);
+        assert_eq!(epoch.not_after, epoch.ephemeral_request.not_after);
     }
 }
