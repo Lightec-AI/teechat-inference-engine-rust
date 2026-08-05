@@ -23,8 +23,10 @@ The TypeScript repo [`Lightec-AI/InferenceEngine`](https://github.com/Lightec-AI
 Pinned third-party TCB crates:
 
 - `attested-mtls` 0.1.0 — engine-plane TLS material
-- `ope-crypto` / `ope-envelope` / `ope-transport` / `ope-e2e` / `ope-protocol` — git pin
-  `d412005` (RB-05 `verify_and_open` + RB-06 transcript; ahead of crates.io 0.1.0)
+- `ope-crypto` / `ope-envelope` / `ope-transport` / `ope-e2e` — git pin `d412005`
+  (RB-05 `verify_and_open` + RB-06 transcript)
+- `ope-protocol` — git pin `e82e9aa` (CPU endorsement wire type); Rust-only ARCH-CHAL
+  work-kind constants are exposed by `ie-protocol`
 
 Native `.so` hashes are pinned in [`config/tcb-pins.json`](config/tcb-pins.json).
 

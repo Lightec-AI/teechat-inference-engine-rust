@@ -53,7 +53,8 @@ pub use sev_snp::{
     bind_epoch_report_data_64, bind_report_data_64, build_engine_attestation_bundle,
     build_engine_epoch_attestation_bundle, challenge_canonical_launch_digest,
     encode_sev_snp_quote_wrapper, extract_measurement_from_report, extract_report_data_from_report,
-    is_sev_snp_guest_device_available, launch_digest_from_report, parse_sev_snp_quote_wrapper,
+    is_sev_snp_guest_device_available, launch_digest_from_report,
+    load_cpu_tee_endorsement_from_env, parse_sev_snp_quote_wrapper,
     request_sev_snp_attestation_report, should_use_sev_snp_attestation,
     verify_sev_snp_attestation_report, verify_wrapper_report_data, SevSnpQuoteWrapper,
 };

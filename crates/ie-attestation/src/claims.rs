@@ -99,6 +99,7 @@ impl QuoteClaims {
                 quote: cpu_quote,
                 verdict: AttestationVerdict::Pass,
                 policy_id: policy_id.to_string(),
+                endorsement: None,
             },
             gpu_tee: GpuTeeAttestation {
                 kind: GpuTeeKind::NvCc,

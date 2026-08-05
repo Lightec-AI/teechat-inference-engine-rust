@@ -3,12 +3,14 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{future::Future, pin::Pin};
 
 use ie_protocol::{
     traffic_class_header_meta_consistent, OpeEnvelope, TrafficClassConsistency,
-    CONTENT_TYPE_OPE_JSON, CONTENT_TYPE_OPE_JSON_STREAM, ENGINE_PLANE_PATH_INFERENCE_RESULT,
-    ENGINE_PLANE_PATH_WORK_PULL, HEADER_OPE_REQUEST_ID, HEADER_OPE_SESSION_ID,
-    HEADER_OPE_TRAFFIC_CLASS, HEADER_USAGE_REPORT,
+    CONTENT_TYPE_OPE_JSON, CONTENT_TYPE_OPE_JSON_STREAM, ENGINE_PLANE_PATH_CHALLENGE_RESULT,
+    ENGINE_PLANE_PATH_INFERENCE_RESULT, ENGINE_PLANE_PATH_WORK_PULL, HEADER_OPE_REQUEST_ID,
+    HEADER_OPE_SESSION_ID, HEADER_OPE_TRAFFIC_CLASS, HEADER_OPE_WORK_KIND, HEADER_USAGE_REPORT,
+    OPE_WORK_KIND_CHALLENGE,
 };
 use tokio::sync::Notify;
 use tracing::{info, warn};
@@ -17,13 +19,19 @@ use crate::desired_pool::{
     parse_desired_pool_target_header, DesiredPoolTargetCallback, HEADER_OPE_DESIRED_POOL_TARGET,
 };
 use crate::infer::{
-    is_gateway_plane_task_envelope, run_ope_inference_on_envelope, NdjsonStreamWriter,
-    OpeInferenceOptions, validate_ope_inference_envelope, GateResult,
+    is_gateway_plane_task_envelope, run_ope_inference_on_envelope, validate_ope_inference_envelope,
+    GateResult, NdjsonStreamWriter, OpeInferenceOptions,
 };
 use ie_upstream::VllmChatClient;
 
 use super::error::PlaneError;
 use super::session::{PlaneTransport, StreamingPostHandle};
+
+pub type EngineChallengeHandlerFuture = Pin<
+    Box<dyn Future<Output = Result<crate::EngineChallengeWireResponse, String>> + Send + 'static>,
+>;
+pub type EngineChallengeHandler =
+    Arc<dyn Fn(crate::EngineChallengeWireRequest) -> EngineChallengeHandlerFuture + Send + Sync>;
 
 pub struct PullWorkerHandle {
     stop: Arc<AtomicBool>,
@@ -54,6 +62,7 @@ pub fn start_pull_worker(
     session_id: String,
     inference: OpeInferenceOptions,
     on_desired_pool_target: Option<DesiredPoolTargetCallback>,
+    answer_challenge: Option<EngineChallengeHandler>,
     on_transport_lost: Option<crate::pull_workers::TransportLostFn>,
 ) -> PullWorkerHandle {
     let stop = Arc::new(AtomicBool::new(false));
@@ -77,6 +86,7 @@ pub fn start_pull_worker(
                 &inference,
                 busy_c.clone(),
                 on_desired_pool_target.as_ref(),
+                answer_challenge.as_ref(),
             )
             .await
             {
@@ -115,12 +125,68 @@ enum WorkPullOutcome {
     Processed,
 }
 
+async fn answer_challenge_work(
+    transport: &dyn PlaneTransport,
+    session_id: &str,
+    request_id: &str,
+    body: &[u8],
+    answer_challenge: Option<&EngineChallengeHandler>,
+) -> Result<WorkPullOutcome, PlaneError> {
+    let result = match serde_json::from_slice::<crate::EngineChallengeWireRequest>(body) {
+        Ok(request) if request.nonce_b64.trim().is_empty() => Err("nonce_b64_required".to_string()),
+        Ok(mut request) => {
+            request.nonce_b64 = request.nonce_b64.trim().to_string();
+            request.epoch_id = request.epoch_id.map(|epoch_id| epoch_id.trim().to_string());
+            match answer_challenge {
+                Some(handler) => handler(request).await,
+                None => Err("challenge_handler_unavailable".to_string()),
+            }
+        }
+        Err(err) => Err(format!("challenge_request_json: {err}")),
+    };
+
+    let (status, response_body) = match result {
+        Ok(response) => (
+            200u16,
+            serde_json::to_vec(&response).map_err(PlaneError::Json)?,
+        ),
+        Err(error) => (
+            500u16,
+            serde_json::to_vec(&serde_json::json!({ "error": error })).map_err(PlaneError::Json)?,
+        ),
+    };
+    let status_header = status.to_string();
+    let headers = [
+        (HEADER_OPE_SESSION_ID, session_id),
+        (HEADER_OPE_REQUEST_ID, request_id),
+        ("x-ope-status", status_header.as_str()),
+    ];
+    let post = transport
+        .request_bytes(
+            "POST",
+            ENGINE_PLANE_PATH_CHALLENGE_RESULT,
+            Some(&response_body),
+            Some("application/json"),
+            &headers,
+        )
+        .await?;
+    if post.status >= 400 {
+        warn!(
+            status = post.status,
+            request_id, "challenge result rejected"
+        );
+    }
+    info!(request_id, status, "engine challenge work answered");
+    Ok(WorkPullOutcome::Processed)
+}
+
 async fn pull_once(
     transport: &dyn PlaneTransport,
     session_id: &str,
     inference: &OpeInferenceOptions,
     busy: Arc<AtomicBool>,
     on_desired_pool_target: Option<&DesiredPoolTargetCallback>,
+    answer_challenge: Option<&EngineChallengeHandler>,
 ) -> Result<WorkPullOutcome, PlaneError> {
     let resp = transport
         .request_bytes(
@@ -152,7 +218,23 @@ async fn pull_once(
         return Ok(WorkPullOutcome::Idle);
     }
 
-    let traffic_class_header = resp.header_value(HEADER_OPE_TRAFFIC_CLASS).map(str::to_string);
+    if resp.header_value(HEADER_OPE_WORK_KIND) == Some(OPE_WORK_KIND_CHALLENGE) {
+        busy.store(true, Ordering::SeqCst);
+        let result = answer_challenge_work(
+            transport,
+            session_id,
+            &request_id,
+            &resp.body,
+            answer_challenge,
+        )
+        .await;
+        busy.store(false, Ordering::SeqCst);
+        return result;
+    }
+
+    let traffic_class_header = resp
+        .header_value(HEADER_OPE_TRAFFIC_CLASS)
+        .map(str::to_string);
 
     let envelope: OpeEnvelope = serde_json::from_slice(&resp.body)
         .map_err(|e| PlaneError::H2(format!("work envelope json: {e}")))?;
@@ -203,10 +285,7 @@ async fn pull_once(
     };
 
     let post = if is_gateway_plane_task_envelope(&envelope)
-        || !matches!(
-            validate_ope_inference_envelope(&envelope),
-            GateResult::Ok
-        )
+        || !matches!(validate_ope_inference_envelope(&envelope), GateResult::Ok)
     {
         // Non-streaming: gateway-plane-task or gate reject (JSON error body).
         let mut stream_buf = Vec::new();
@@ -335,4 +414,193 @@ async fn pull_once(
     );
     busy.store(false, Ordering::SeqCst);
     Ok(WorkPullOutcome::Processed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use ie_crypto::{CryptoProvider, MockCryptoProvider};
+    use ie_protocol::{
+        CpuTeeEndorsement, ENGINE_PLANE_PATH_CHALLENGE_RESULT, HEADER_OPE_WORK_KIND,
+        OPE_WORK_KIND_CHALLENGE,
+    };
+    use std::sync::Mutex;
+
+    use crate::{
+        EngineChallengeCpuResponse, EngineChallengeEngineResponse, EngineChallengeEpoch,
+        EngineChallengeMeasurement, EngineChallengeWireResponse, H2BytesResponse, H2JsonResponse,
+    };
+
+    #[derive(Default)]
+    struct ChallengeTransport {
+        pull: Mutex<Option<H2BytesResponse>>,
+        posted: Mutex<Option<(String, Vec<(String, String)>, Bytes)>>,
+    }
+
+    #[async_trait]
+    impl PlaneTransport for ChallengeTransport {
+        async fn request_json(
+            &self,
+            _method: &str,
+            _path: &str,
+            _body: Option<&serde_json::Value>,
+            _headers: &[(&str, &str)],
+        ) -> Result<H2JsonResponse, PlaneError> {
+            Err(PlaneError::H2("unexpected request_json".into()))
+        }
+
+        async fn request_bytes(
+            &self,
+            method: &str,
+            path: &str,
+            body: Option<&[u8]>,
+            _content_type: Option<&str>,
+            headers: &[(&str, &str)],
+        ) -> Result<H2BytesResponse, PlaneError> {
+            if method == "GET" && path == ENGINE_PLANE_PATH_WORK_PULL {
+                return Ok(self.pull.lock().unwrap().take().unwrap_or(H2BytesResponse {
+                    status: 204,
+                    headers: vec![],
+                    body: Bytes::new(),
+                }));
+            }
+            if method == "POST" && path == ENGINE_PLANE_PATH_CHALLENGE_RESULT {
+                *self.posted.lock().unwrap() = Some((
+                    path.to_string(),
+                    headers
+                        .iter()
+                        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                        .collect(),
+                    Bytes::copy_from_slice(body.unwrap_or_default()),
+                ));
+                return Ok(H2BytesResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: Bytes::new(),
+                });
+            }
+            Err(PlaneError::H2(format!("unexpected {method} {path}")))
+        }
+
+        async fn close(&self) -> Result<(), PlaneError> {
+            Ok(())
+        }
+    }
+
+    fn inference_options() -> OpeInferenceOptions {
+        OpeInferenceOptions {
+            request_id: None,
+            decrypt_handle: 0,
+            rotating: None,
+            provider: Arc::new(MockCryptoProvider::new()) as Arc<dyn CryptoProvider>,
+            vllm_base_url: String::new(),
+            vllm_api_key: None,
+            task_vllm_base_url: None,
+            task_vllm_api_key: None,
+            task_model_id: None,
+            embeddings_base_url: None,
+            embeddings_api_key: None,
+            embeddings_default_model: None,
+            vllm: VllmChatClient::default(),
+            chunk_chars: 8,
+            kv: None,
+            usage_signing_key: None,
+            admitter: None,
+        }
+    }
+
+    fn challenge_response(nonce_b64: String) -> EngineChallengeWireResponse {
+        EngineChallengeWireResponse {
+            schema_version: 1,
+            report_data_version: 1,
+            engine: EngineChallengeEngineResponse {
+                engine_id: "eng-1".into(),
+                build_version: "0.15.0".into(),
+                measurement: EngineChallengeMeasurement::LaunchDigest {
+                    launch_digest: "a".repeat(64),
+                    image_digest: "b".repeat(64),
+                },
+                policy_hash: "c".repeat(64),
+            },
+            epoch: EngineChallengeEpoch {
+                epoch_id: "ep-1".into(),
+                not_before: "2026-08-01T00:00:00.000Z".into(),
+                not_after: "2026-08-02T00:00:00.000Z".into(),
+                mlkem_encapsulation_key: "bWxrZW0=".into(),
+                x25519_public: "eDI1NTE5".into(),
+                usage_signing_public: "dXNhZ2U=".into(),
+            },
+            challenge_nonce_b64: nonce_b64,
+            cpu: EngineChallengeCpuResponse {
+                quote_format: "snp_report".into(),
+                quote_b64: "cXVvdGU=".into(),
+                endorsement: CpuTeeEndorsement {
+                    vcek_der_b64: "dmNlaw==".into(),
+                    ask_der_b64: None,
+                    ark_der_b64: None,
+                    crl_der_b64: None,
+                },
+            },
+            gpu: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn challenge_work_posts_challenge_result_without_parsing_an_ope_envelope() {
+        let nonce_b64 = crate::encode_nonce_b64_url(&[7u8; 32]);
+        let transport = ChallengeTransport {
+            pull: Mutex::new(Some(H2BytesResponse {
+                status: 200,
+                headers: vec![
+                    (HEADER_OPE_REQUEST_ID.into(), "req-challenge".into()),
+                    (HEADER_OPE_WORK_KIND.into(), OPE_WORK_KIND_CHALLENGE.into()),
+                ],
+                body: Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "nonce_b64": nonce_b64.clone(),
+                        "epoch_id": "ep-1"
+                    }))
+                    .unwrap(),
+                ),
+            })),
+            posted: Mutex::new(None),
+        };
+        let expected_nonce = nonce_b64.clone();
+        let handler: EngineChallengeHandler = Arc::new(move |request| {
+            assert_eq!(request.nonce_b64, expected_nonce);
+            assert_eq!(request.epoch_id.as_deref(), Some("ep-1"));
+            let response = challenge_response(request.nonce_b64);
+            Box::pin(async move { Ok(response) })
+        });
+        let busy = Arc::new(AtomicBool::new(false));
+
+        let outcome = pull_once(
+            &transport,
+            "sess-1",
+            &inference_options(),
+            Arc::clone(&busy),
+            None,
+            Some(&handler),
+        )
+        .await
+        .expect("challenge work");
+        assert!(matches!(outcome, WorkPullOutcome::Processed));
+        assert!(!busy.load(Ordering::SeqCst));
+
+        let (path, headers, body) = transport.posted.lock().unwrap().clone().expect("result");
+        assert_eq!(path, ENGINE_PLANE_PATH_CHALLENGE_RESULT);
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == HEADER_OPE_SESSION_ID && value == "sess-1"));
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == HEADER_OPE_REQUEST_ID && value == "req-challenge"));
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "x-ope-status" && value == "200"));
+        let response: EngineChallengeWireResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response.challenge_nonce_b64, nonce_b64);
+    }
 }

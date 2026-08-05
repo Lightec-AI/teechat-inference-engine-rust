@@ -27,7 +27,9 @@ pub use disconnect::{
 pub use ephemeral::post_ephemeral_on_attested_session;
 pub use error::PlaneError;
 pub use gateway_platform_verify::platform_policy_verifier_from_env;
-pub use pull::{start_pull_worker, PullWorkerHandle};
+pub use pull::{
+    start_pull_worker, EngineChallengeHandler, EngineChallengeHandlerFuture, PullWorkerHandle,
+};
 pub use session::{
     AttestedH2Session, H2BytesResponse, H2JsonResponse, PlaneTransport, StreamingPostHandle,
 };

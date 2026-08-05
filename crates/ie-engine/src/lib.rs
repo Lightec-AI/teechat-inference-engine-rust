@@ -4,6 +4,7 @@ mod config;
 mod controls;
 mod cutover;
 mod desired_pool;
+mod engine_challenge;
 mod epoch;
 mod error;
 mod gateway_migration;
@@ -35,6 +36,14 @@ pub use desired_pool::{
     spawn_desired_pool_applier, DesiredPoolTargetCallback, DESIRED_POOL_DEBOUNCE_MS,
     HEADER_OPE_DESIRED_POOL_TARGET,
 };
+pub use engine_challenge::{
+    build_engine_challenge_preimage, build_engine_challenge_report_data, decode_nonce_b64_url,
+    encode_nonce_b64_url, mint_engine_challenge_response, EngineChallengeCpuResponse,
+    EngineChallengeEngineResponse, EngineChallengeEpoch, EngineChallengeError,
+    EngineChallengeGpuResponse, EngineChallengeMeasurement, EngineChallengeReportDataInput,
+    EngineChallengeWireRequest, EngineChallengeWireResponse, MintEngineChallengeArgs,
+    ENGINE_CHALLENGE_MAGIC, ENGINE_CHALLENGE_REPORT_DATA_VERSION, ENGINE_CHALLENGE_SCHEMA_VERSION,
+};
 pub use epoch::{
     compute_epoch_rotate_at_ms, create_engine_epoch, dispose_engine_epoch,
     epoch_rotation_lead_ms_from_env, epoch_rotation_policy_from_env, epoch_ttl_ms_from_policy,
@@ -64,10 +73,11 @@ pub use plane::{
     normalize_gateway_connect_challenge_nonce, open_pooled_connection,
     open_pooled_connection_on_transport, platform_policy_verifier_from_env,
     post_disconnect_on_attested_session, post_ephemeral_on_attested_session, start_pull_worker,
-    AttestedH2Session, EnginePlaneDialOptions, GatewayAttestationVerifier, H2BytesResponse,
-    H2JsonResponse, Http2EnginePlaneConnector, NonceEchoGatewayAttestationVerifier,
-    NullGatewayAttestationVerifier, PlaneError, PlaneTransport,
-    PlatformPolicyGatewayAttestationVerifier, PullWorkerHandle, StreamingPostHandle,
+    AttestedH2Session, EngineChallengeHandler, EngineChallengeHandlerFuture,
+    EnginePlaneDialOptions, GatewayAttestationVerifier, H2BytesResponse, H2JsonResponse,
+    Http2EnginePlaneConnector, NonceEchoGatewayAttestationVerifier, NullGatewayAttestationVerifier,
+    PlaneError, PlaneTransport, PlatformPolicyGatewayAttestationVerifier, PullWorkerHandle,
+    StreamingPostHandle,
 };
 pub use pool::{
     sessions_by_gateway_url_from_slots, AttestationRefreshFn, GatewayMigrationResult,

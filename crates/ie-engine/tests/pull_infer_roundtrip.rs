@@ -233,7 +233,7 @@ async fn mock_gateway_assign_work_decrypt_vllm_encrypt_result() {
         admitter: None,
     };
 
-    let worker = start_pull_worker(gateway.clone(), "sess-1".into(), inference, None, None);
+    let worker = start_pull_worker(gateway.clone(), "sess-1".into(), inference, None, None, None);
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
@@ -368,7 +368,7 @@ async fn mock_gateway_embeddings_tei_encrypt_result() {
         admitter: None,
     };
 
-    let worker = start_pull_worker(gateway.clone(), "sess-embed".into(), inference, None, None);
+    let worker = start_pull_worker(gateway.clone(), "sess-embed".into(), inference, None, None, None);
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {

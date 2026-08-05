@@ -126,6 +126,7 @@ mod tests {
                     quote: "q".into(),
                     verdict: AttestationVerdict::Pass,
                     policy_id: "p".into(),
+                    endorsement: None,
                 },
                 gpu_tee: GpuTeeAttestation {
                     kind: GpuTeeKind::NvCc,

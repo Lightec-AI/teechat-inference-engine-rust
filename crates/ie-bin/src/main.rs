@@ -16,11 +16,12 @@ use ie_engine::{
     configure_event_log_from_env, create_pool_connect_throttle_from_env,
     engine_instance_id_from_env, epoch_rotation_policy_from_env,
     generate_gateway_connect_challenge_nonce, install_engine_controls,
-    platform_policy_verifier_from_env, spawn_desired_pool_applier, start_pull_worker,
-    warn_pull_worker_start, DesiredPoolTargetCallback, EnginePlaneDialOptions, EphemeralPoster,
+    mint_engine_challenge_response, platform_policy_verifier_from_env, spawn_desired_pool_applier,
+    start_pull_worker, warn_pull_worker_start, DesiredPoolTargetCallback, EngineChallengeEpoch,
+    EngineChallengeHandler, EngineChallengeMeasurement, EnginePlaneDialOptions, EphemeralPoster,
     EpochEvidenceMinter, EpochRotatedCallback, EpochRotator, EpochRotatorOptions,
-    EpochRotatorSession, Http2EnginePlaneConnector, OpeInferenceOptions, PullWorkerStartFn,
-    RotatingEpochDecryptor, SupervisedPool, SupervisedPoolConfig,
+    EpochRotatorSession, Http2EnginePlaneConnector, MintEngineChallengeArgs, OpeInferenceOptions,
+    PullWorkerStartFn, RotatingEpochDecryptor, SupervisedPool, SupervisedPoolConfig,
 };
 use ie_protocol::{AttestedConnectRequest, EngineEphemeralRegisterRequest};
 use ie_runtime::{engine_plane_client_tls, env_map_from_process, load_engine_env_files};
@@ -216,12 +217,14 @@ fn make_pull_worker_start_fn(
     h2: Arc<Http2EnginePlaneConnector>,
     inference_template: OpeInferenceOptions,
     on_desired: DesiredPoolTargetCallback,
+    answer_challenge: EngineChallengeHandler,
     pool: Arc<SupervisedPool>,
 ) -> PullWorkerStartFn {
     Arc::new(move |session_id: String| {
         let h2 = Arc::clone(&h2);
         let inference = clone_inference_options(&inference_template);
         let on_desired = Arc::clone(&on_desired);
+        let answer_challenge = Arc::clone(&answer_challenge);
         let pool = Arc::clone(&pool);
         Box::pin(async move {
             let transport = h2
@@ -239,8 +242,76 @@ fn make_pull_worker_start_fn(
                 session_id,
                 inference,
                 Some(on_desired),
+                Some(answer_challenge),
                 Some(on_lost),
             ))
+        })
+    })
+}
+
+fn make_engine_challenge_handler(
+    rotator: Arc<EpochRotator>,
+    env: HashMap<String, String>,
+    engine_id: String,
+) -> EngineChallengeHandler {
+    Arc::new(move |request| {
+        let rotator = Arc::clone(&rotator);
+        let env = env.clone();
+        let engine_id = engine_id.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let epoch = EngineChallengeEpoch::from(&rotator.current_epoch());
+                let attestation = rotator
+                    .current_attestation()
+                    .ok_or_else(|| "challenge_attestation_unavailable".to_string())?;
+                let launch_digest = env
+                    .get("TEECHAT_ENGINE_LAUNCH_DIGEST")
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "")
+                    .to_string();
+                let launch_digest = if launch_digest.is_empty() {
+                    "0".repeat(64)
+                } else {
+                    launch_digest
+                };
+                let image_digest = env
+                    .get("TEECHAT_ENGINE_IMAGE_DIGEST")
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "0".repeat(64));
+                let policy_hash = env
+                    .get("TEECHAT_ENGINE_POLICY_HASH")
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        if attestation.cpu_tee.policy_id.len() == 64 {
+                            attestation.cpu_tee.policy_id.clone()
+                        } else {
+                            "0".repeat(64)
+                        }
+                    });
+                let measurement = EngineChallengeMeasurement::LaunchDigest {
+                    launch_digest,
+                    image_digest,
+                };
+                mint_engine_challenge_response(&MintEngineChallengeArgs {
+                    request: &request,
+                    engine_id: &engine_id,
+                    build_version: &attestation.engine.version,
+                    policy_hash_hex: &policy_hash,
+                    measurement: &measurement,
+                    epoch: &epoch,
+                    gpu_evidence_b64: Some(&attestation.gpu_tee.evidence),
+                    gpu_collected_at: None,
+                    env: &env,
+                })
+                .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| format!("challenge_mint_join: {error}"))?
         })
     })
 }
@@ -624,6 +695,8 @@ async fn run_engine(
         };
 
         let on_desired = spawn_desired_pool_applier(Arc::clone(&pool), pool_config.clone());
+        let answer_challenge =
+            make_engine_challenge_handler(Arc::clone(&rotator), env.clone(), engine_id.clone());
         pool.set_on_session_ready(Some({
             let rotator = Arc::clone(&rotator);
             Arc::new(move |session_id: String| {
@@ -641,6 +714,7 @@ async fn run_engine(
             Arc::clone(&h2),
             inference_template,
             on_desired,
+            answer_challenge,
             Arc::clone(&pool),
         )))
         .await;

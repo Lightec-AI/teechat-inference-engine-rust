@@ -14,6 +14,7 @@ use crate::measurements::resolve_binary_measurements_from_env;
 use crate::mock_quote::build_mock_cpu_quote;
 use crate::nv_cc::{build_gpu_not_applicable_evidence, collect_nv_cc_gpu_evidence_b64};
 
+use super::endorsement::load_cpu_tee_endorsement_from_env;
 use super::guest_report::{request_sev_snp_attestation_report, should_use_sev_snp_attestation};
 use super::launch_digest::launch_digest_from_report;
 use super::quote::{
@@ -25,6 +26,14 @@ fn env_flag_true(env: &HashMap<String, String>, key: &str) -> bool {
     env.get(key)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+fn with_cpu_endorsement(
+    mut bundle: AttestationBundle,
+    env: &HashMap<String, String>,
+) -> AttestationBundle {
+    bundle.cpu_tee.endorsement = load_cpu_tee_endorsement_from_env(env);
+    bundle
 }
 
 /// Mint the connect-time attestation bundle for live (or mock/stub) boots.
@@ -104,13 +113,19 @@ fn build_bundle(
         } else {
             collect_nv_cc_gpu_evidence_b64(env, None)?
         };
-        return Ok(claims.into_attestation_bundle(cpu_quote, gpu_evidence, &policy_id));
+        return Ok(with_cpu_endorsement(
+            claims.into_attestation_bundle(cpu_quote, gpu_evidence, &policy_id),
+            env,
+        ));
     }
 
     if env_flag_true(env, "TEECHAT_ENGINE_ALLOW_MOCK_ATTEST_ON_SNP") {
         let cpu_quote = build_mock_cpu_quote(&claims);
         let gpu_evidence = collect_nv_cc_gpu_evidence_b64(env, None)?;
-        return Ok(claims.into_attestation_bundle(cpu_quote, gpu_evidence, &policy_id));
+        return Ok(with_cpu_endorsement(
+            claims.into_attestation_bundle(cpu_quote, gpu_evidence, &policy_id),
+            env,
+        ));
     }
 
     let report_data = match epoch {
@@ -146,7 +161,10 @@ fn build_bundle(
         claims: claims.clone(),
     };
     let cpu_quote = encode_sev_snp_quote_wrapper(&wrapper);
-    Ok(claims.into_attestation_bundle(cpu_quote, gpu_evidence, &policy_id))
+    Ok(with_cpu_endorsement(
+        claims.into_attestation_bundle(cpu_quote, gpu_evidence, &policy_id),
+        env,
+    ))
 }
 
 #[cfg(test)]
@@ -262,5 +280,25 @@ mod tests {
             match_epoch_evidence(&claims, &subject(&e, &h)).unwrap_err(),
             EpochEvidenceError::Absent
         );
+    }
+
+    #[test]
+    fn connect_bundle_attaches_configured_cpu_endorsement() {
+        let dir = TempDir::new().unwrap();
+        let mut env = stub_env();
+        env.insert("TEECHAT_SNP_VCEK_DER_B64".into(), "dnNlaw==".into());
+        env.insert("TEECHAT_SNP_ASK_DER_B64".into(), "YXNr".into());
+        let bundle = build_engine_attestation_bundle(
+            &env,
+            dir.path(),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            &"0".repeat(64),
+            None,
+        )
+        .expect("bundle");
+
+        let endorsement = bundle.cpu_tee.endorsement.expect("endorsement");
+        assert_eq!(endorsement.vcek_der_b64, "dnNlaw==");
+        assert_eq!(endorsement.ask_der_b64.as_deref(), Some("YXNr"));
     }
 }

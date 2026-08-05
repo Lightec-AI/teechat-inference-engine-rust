@@ -120,6 +120,10 @@ impl EpochRotator {
         self.current.read().expect("current epoch").clone()
     }
 
+    pub fn current_attestation(&self) -> Option<AttestationBundle> {
+        self.attestation.read().expect("attestation").clone()
+    }
+
     pub fn set_attestation(&self, bundle: AttestationBundle) {
         *self.attestation.write().expect("attestation") = Some(bundle);
     }
