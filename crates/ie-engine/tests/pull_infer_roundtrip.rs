@@ -230,6 +230,7 @@ async fn mock_gateway_assign_work_decrypt_vllm_encrypt_result() {
         chunk_chars: 8,
         kv: None,
         usage_signing_key: None,
+        admitter: None,
     };
 
     let worker = start_pull_worker(gateway.clone(), "sess-1".into(), inference, None, None);
@@ -364,6 +365,7 @@ async fn mock_gateway_embeddings_tei_encrypt_result() {
         chunk_chars: 8,
         kv: None,
         usage_signing_key: None,
+        admitter: None,
     };
 
     let worker = start_pull_worker(gateway.clone(), "sess-embed".into(), inference, None, None);

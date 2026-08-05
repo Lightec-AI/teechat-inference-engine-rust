@@ -19,4 +19,7 @@ pub enum CryptoError {
     UnknownSession(u64),
     #[error("MockCryptoProvider cannot {0}: use real provider for E2E")]
     MockUnsupported(String),
+    /// RB-05 envelope admission failure (`code`, detail).
+    #[error("ope admit {0}: {1}")]
+    Admit(String, String),
 }

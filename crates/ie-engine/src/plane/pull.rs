@@ -199,6 +199,7 @@ async fn pull_once(
         chunk_chars: inference.chunk_chars,
         kv: inference.kv.clone(),
         usage_signing_key: inference.usage_signing_key.clone(),
+        admitter: inference.admitter.clone(),
     };
 
     let post = if is_gateway_plane_task_envelope(&envelope)

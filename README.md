@@ -20,12 +20,24 @@ The TypeScript repo [`Lightec-AI/InferenceEngine`](https://github.com/Lightec-AI
 
 ## Dependencies
 
-Pinned third-party TCB crates (crates.io):
+Pinned third-party TCB crates:
 
 - `attested-mtls` 0.1.0 — engine-plane TLS material
-- `ope-crypto`, `ope-envelope`, `ope-transport`, `ope-e2e` 0.1.0 — hybrid PQ E2E
+- `ope-crypto` / `ope-envelope` / `ope-transport` / `ope-e2e` / `ope-protocol` — git pin
+  `d412005` (RB-05 `verify_and_open` + RB-06 transcript; ahead of crates.io 0.1.0)
 
 Native `.so` hashes are pinned in [`config/tcb-pins.json`](config/tcb-pins.json).
+
+## RB-05 / RB-06 (OPE auth)
+
+| Env | Role |
+|-----|------|
+| `TEECHAT_OPE_ENGINE_TRUST_KEYS` | JSON `kid → Ed25519 public (base64url)`. Falls back to `TEECHAT_OPE_GATEWAY_TRUST_KEYS`. No `*` wildcard. |
+| `TEECHAT_OPE_ENGINE_VERIFY` | `off` \| `signed-only` (default when keys set) \| `required` |
+| `TEECHAT_OPE_ENGINE_EXPECTED_RECIPIENT` | Default `teechat-gateway` (chat clients) |
+| `TEECHAT_OPE_RESPONSE_TRANSCRIPT` | **Keep off** until clients consume RB-06 frames |
+
+`signed-only` authenticates signed chat envelopes via `verify_and_open` before hybrid decrypt; unsigned OpenAPI envelopes still use the legacy decrypt path.
 
 ## Build
 

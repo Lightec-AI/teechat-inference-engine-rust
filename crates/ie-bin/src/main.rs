@@ -208,6 +208,7 @@ fn clone_inference_options(template: &OpeInferenceOptions) -> OpeInferenceOption
         chunk_chars: template.chunk_chars,
         kv: template.kv.clone(),
         usage_signing_key: template.usage_signing_key.clone(),
+        admitter: template.admitter.clone(),
     }
 }
 
@@ -601,6 +602,25 @@ async fn run_engine(
                 .unwrap_or(8),
             kv: Some(Arc::clone(&shared_kv)),
             usage_signing_key: Some(signing_key),
+            admitter: match ie_crypto::EnvelopeAdmitter::from_env(env) {
+                Ok(Some(a)) => {
+                    tracing::info!(
+                        mode = ?a.mode(),
+                        "RB-05 envelope admission enabled"
+                    );
+                    let arc = Arc::new(a);
+                    ie_crypto::install_global_admitter(Some(Arc::clone(&arc)));
+                    Some(arc)
+                }
+                Ok(None) => {
+                    tracing::info!("RB-05 envelope admission off (no trust keys / VERIFY=off)");
+                    None
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "RB-05 envelope admission config invalid");
+                    return Err(e.to_string().into());
+                }
+            },
         };
 
         let on_desired = spawn_desired_pool_applier(Arc::clone(&pool), pool_config.clone());

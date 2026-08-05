@@ -11,10 +11,19 @@ mod error;
 pub use error::CryptoError;
 
 #[cfg(feature = "ope")]
+mod admit;
+#[cfg(feature = "ope")]
 mod envelope;
 #[cfg(feature = "ope")]
 mod provider;
+#[cfg(feature = "ope")]
+mod response_transcript;
 
+#[cfg(feature = "ope")]
+pub use admit::{
+    global_admitter, install_global_admitter, parse_trust_keys_json, EnvelopeAdmitMode,
+    EnvelopeAdmitter, MapKeyResolver,
+};
 #[cfg(feature = "ope")]
 pub use envelope::{
     envelope_from_json, envelope_to_json, ope_to_protocol_envelope, protocol_to_ope_envelope,
@@ -25,6 +34,8 @@ pub use provider::{
     test_sender_keypair, CryptoProvider, EngineHybridKeypair, MockCryptoProvider,
     RealCryptoProvider, ResponseSession,
 };
+#[cfg(feature = "ope")]
+pub use response_transcript::{response_transcript_enabled, ResponseTranscriptSession};
 
 #[cfg(feature = "ope")]
 pub mod ope {

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use ie_crypto::CryptoProvider;
+use ie_crypto::{CryptoError, CryptoProvider, EnvelopeAdmitter};
 use ie_protocol::{
     encode_ope_stream_line, OpeEnvelope, OpeStreamFrame, CONTENT_TYPE_OPE_JSON,
     CONTENT_TYPE_OPE_JSON_STREAM,
@@ -58,6 +58,8 @@ pub struct OpeInferenceOptions {
     pub kv: Option<Arc<std::sync::Mutex<std::collections::HashMap<String, ConversationKvState>>>>,
     /// Ed25519 signing key for usage reports (required for non-empty usage headers).
     pub usage_signing_key: Option<ed25519_dalek::SigningKey>,
+    /// RB-05: optional envelope admission before decrypt (`None` = legacy).
+    pub admitter: Option<Arc<EnvelopeAdmitter>>,
 }
 
 fn resolve_decrypt_handle(
@@ -167,6 +169,28 @@ pub async fn run_ope_inference_on_envelope(
                 body: ope_inference_reject_body(error.as_str(), detail.as_deref()),
                 usage_header: None,
             };
+        }
+    }
+
+    if let Some(admitter) = &options.admitter {
+        match admitter.admit(envelope) {
+            Ok(_) => {}
+            Err(CryptoError::Admit(code, detail)) => {
+                return OpeInferenceResult {
+                    status: 401,
+                    content_type: "application/json".into(),
+                    body: json!({ "error": code, "detail": detail }).to_string(),
+                    usage_header: None,
+                };
+            }
+            Err(e) => {
+                return OpeInferenceResult {
+                    status: 400,
+                    content_type: "application/json".into(),
+                    body: json!({ "error": "ope_admit_failed", "detail": e.to_string() }).to_string(),
+                    usage_header: None,
+                };
+            }
         }
     }
 

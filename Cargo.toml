@@ -42,10 +42,10 @@ url = "2"
 rand = "0.8"
 rcgen = "0.13"
 attested-mtls = "0.1.0"
-ope-crypto = "0.1.0"
-ope-envelope = "0.1.0"
-ope-transport = "0.1.0"
-ope-e2e = "0.1.0"
+ope-crypto = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d412005221abb8c8e6e8cef0e1410407e91dce3b" }
+ope-envelope = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d412005221abb8c8e6e8cef0e1410407e91dce3b" }
+ope-transport = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d412005221abb8c8e6e8cef0e1410407e91dce3b" }
+ope-e2e = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d412005221abb8c8e6e8cef0e1410407e91dce3b" }
 ie-protocol = { path = "crates/ie-protocol" }
 ie-crypto = { path = "crates/ie-crypto" }
 ie-attestation = { path = "crates/ie-attestation" }
