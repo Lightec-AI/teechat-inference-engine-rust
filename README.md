@@ -39,6 +39,13 @@ Native `.so` hashes are pinned in [`config/tcb-pins.json`](config/tcb-pins.json)
 
 `signed-only` authenticates signed chat envelopes via `verify_and_open` before hybrid decrypt; unsigned OpenAPI envelopes still use the legacy decrypt path.
 
+### Packaging for the next train (flags stay off)
+
+1. Tag `v*` → Actions packs `inference-engine-runtime-*.tar.gz` + `SHA256SUMS`.
+2. TeaChat pins `ieRuntimeSha256` / asset in `config/engine-version.json` (+ platform-binaries row at cutover).
+3. Guest install via TeaChat `install-engine-release.sh` / blue-green — **do not** set `TEECHAT_OPE_ENGINE_VERIFY` or `TEECHAT_OPE_RESPONSE_TRANSCRIPT` on prod until matching client builds are shipped.
+4. IE-only ZD (same app-verity) is allowed for the binary bump; env flips for VERIFY/TRANSCRIPT are a **separate** change window.
+
 ## Build
 
 Requires **Rust 1.88** (see `rust-toolchain.toml`).
