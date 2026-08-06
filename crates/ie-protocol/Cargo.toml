@@ -8,4 +8,4 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-ope-protocol = { git = "https://github.com/Lightec-AI/OPE.git", rev = "e82e9aae0c542ebd4112cafda44d1aa1edaaf5ba" }
+ope-protocol = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d565429a36f389aa165f8efe51f759d4c6116f57" }
