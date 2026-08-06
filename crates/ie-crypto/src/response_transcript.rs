@@ -83,4 +83,16 @@ mod tests {
         reader.accept(&f1).unwrap();
         reader.finish().unwrap();
     }
+
+    #[test]
+    fn flag_off_by_default() {
+        let env = HashMap::new();
+        assert!(!response_transcript_enabled(&env));
+        let mut off = HashMap::new();
+        off.insert("TEECHAT_OPE_RESPONSE_TRANSCRIPT".into(), "off".into());
+        assert!(!response_transcript_enabled(&off));
+        let mut on = HashMap::new();
+        on.insert("TEECHAT_OPE_RESPONSE_TRANSCRIPT".into(), "1".into());
+        assert!(response_transcript_enabled(&on));
+    }
 }

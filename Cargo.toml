@@ -52,3 +52,12 @@ ie-attestation = { path = "crates/ie-attestation" }
 ie-engine = { path = "crates/ie-engine" }
 ie-upstream = { path = "crates/ie-upstream" }
 ie-runtime = { path = "crates/ie-runtime" }
+
+# Offline RB-05/06: prefer TeaChat's vendored OPE (chain field + transcript) over git pins.
+# Remove once crates.io / OPE git revs include ciphertext `chain` + matching envelopes.
+[patch."https://github.com/Lightec-AI/OPE.git"]
+ope-protocol = { path = "../TeaChat/vendor/ope/crates/ope-protocol" }
+ope-crypto = { path = "../TeaChat/vendor/ope/crates/ope-crypto" }
+ope-envelope = { path = "../TeaChat/vendor/ope/crates/ope-envelope" }
+ope-transport = { path = "../TeaChat/vendor/ope/crates/ope-transport" }
+ope-e2e = { path = "../TeaChat/vendor/ope/crates/ope-e2e" }

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use ie_crypto::{CryptoError, CryptoProvider, EnvelopeAdmitter};
+use ie_crypto::{CryptoError, CryptoProvider, EnvelopeAdmitter, ResponseTranscriptSession};
 use ie_protocol::{
     encode_ope_stream_line, OpeEnvelope, OpeStreamFrame, CONTENT_TYPE_OPE_JSON,
     CONTENT_TYPE_OPE_JSON_STREAM,
@@ -86,6 +86,73 @@ fn resolve_usage_signing_key(
         }
     }
     options.usage_signing_key.clone()
+}
+
+fn resolve_epoch_id(options: &OpeInferenceOptions, envelope: &OpeEnvelope) -> String {
+    envelope
+        .e2e
+        .as_ref()
+        .map(|e| e.ephemeral_epoch.clone())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            options
+                .rotating
+                .as_ref()
+                .and_then(|r| r.current_epoch_id())
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn resolve_content_alg(envelope: &OpeEnvelope) -> String {
+    envelope
+        .e2e
+        .as_ref()
+        .and_then(|e| e.content_alg.clone())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "A256GCM".into())
+}
+
+/// Start an RB-06 transcript session when `TEECHAT_OPE_RESPONSE_TRANSCRIPT` is on.
+/// Returns `(signed_header_json_line, session)` or `None` when the flag is off / keys missing.
+fn maybe_begin_response_transcript(
+    options: &OpeInferenceOptions,
+    envelope: &OpeEnvelope,
+) -> Option<(Vec<u8>, ResponseTranscriptSession)> {
+    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    if !ie_crypto::response_transcript_enabled(&env) {
+        return None;
+    }
+    let signing = resolve_usage_signing_key(options, envelope)?;
+    let ope_secret = ope_crypto::secret_key_from_bytes(&signing.to_bytes());
+    let engine_id = envelope
+        .engine_id
+        .clone()
+        .unwrap_or_else(|| "engine".into());
+    let epoch_id = resolve_epoch_id(options, envelope);
+    let content_alg = resolve_content_alg(envelope);
+    match ResponseTranscriptSession::begin(
+        &ope_secret,
+        envelope.nonce.clone(),
+        engine_id,
+        epoch_id,
+        content_alg,
+    ) {
+        Ok((signed, session)) => {
+            let mut line = match serde_json::to_vec(&signed) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "transcript header serialize failed");
+                    return None;
+                }
+            };
+            line.push(b'\n');
+            Some((line, session))
+        }
+        Err(e) => {
+            warn!(error = %e, "transcript session begin failed");
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -338,6 +405,11 @@ async fn run_embeddings_inference(
         }
     }
 
+    let mut transcript = maybe_begin_response_transcript(options, envelope);
+    if let (Some(out), Some((header_line, _))) = (ndjson_out.as_mut(), transcript.as_ref()) {
+        out.write(header_line);
+    }
+
     let json_text = completed.body.to_string();
     let mut chunks: Vec<String> = Vec::new();
     let mut seq: u32 = 0;
@@ -349,6 +421,7 @@ async fn run_embeddings_inference(
         &mut seq,
         &mut chunks,
         ndjson_out,
+        transcript.as_mut().map(|t| &mut t.1),
     );
     options.provider.free_response(resp.session);
 
@@ -533,6 +606,11 @@ async fn run_chat_inference(
         }
     }
 
+    let mut transcript = maybe_begin_response_transcript(options, envelope);
+    if let (Some(out), Some((header_line, _))) = (ndjson_out.as_mut(), transcript.as_ref()) {
+        out.write(header_line);
+    }
+
     tokio::pin!(stream);
     while let Some(item) = stream.next().await {
         match item {
@@ -551,6 +629,7 @@ async fn run_chat_inference(
                         &mut seq,
                         &mut chunks,
                         &mut ndjson_out,
+                        transcript.as_mut().map(|t| &mut t.1),
                     );
                 }
             }
@@ -581,6 +660,7 @@ async fn run_chat_inference(
             &mut seq,
             &mut chunks,
             &mut ndjson_out,
+            transcript.as_mut().map(|t| &mut t.1),
         );
     }
 
@@ -703,13 +783,33 @@ fn encrypt_piece(
     seq: &mut u32,
     chunks: &mut Vec<String>,
     ndjson_out: &mut Option<&mut dyn NdjsonStreamWriter>,
+    transcript: Option<&mut ResponseTranscriptSession>,
 ) {
     match provider.encrypt_response_chunk(session, *seq, piece.as_bytes()) {
         Ok(ciphertext) => {
             if let Some(out) = ndjson_out.as_mut() {
-                if let Ok(line) =
-                    encode_ope_stream_line(&OpeStreamFrame::ciphertext(*seq, &ciphertext, final_))
-                {
+                let frame = match transcript {
+                    Some(tx) => match ope_crypto::decode(&ciphertext) {
+                        Ok(bytes) => match tx.push(&bytes, final_) {
+                            Ok(tf) => OpeStreamFrame::ciphertext_with_chain(
+                                *seq,
+                                &ciphertext,
+                                final_,
+                                Some(tf.chain),
+                            ),
+                            Err(e) => {
+                                warn!(error = %e, "transcript push failed; emitting unchained frame");
+                                OpeStreamFrame::ciphertext(*seq, &ciphertext, final_)
+                            }
+                        },
+                        Err(e) => {
+                            warn!(error = %e, "transcript ciphertext decode failed");
+                            OpeStreamFrame::ciphertext(*seq, &ciphertext, final_)
+                        }
+                    },
+                    None => OpeStreamFrame::ciphertext(*seq, &ciphertext, final_),
+                };
+                if let Ok(line) = encode_ope_stream_line(&frame) {
                     out.write(&line);
                 }
             } else {
@@ -718,6 +818,32 @@ fn encrypt_piece(
             *seq += 1;
         }
         Err(e) => warn!(error = %e, "encrypt_response_chunk failed"),
+    }
+}
+
+/// Attach an RB-06 `chain` to a ciphertext string when a transcript session is present.
+/// Used by unit tests; production path goes through [`encrypt_piece`].
+#[cfg(test)]
+pub fn ciphertext_frame_with_optional_chain(
+    seq: u32,
+    ciphertext_b64url: &str,
+    final_: bool,
+    transcript: Option<&mut ResponseTranscriptSession>,
+) -> OpeStreamFrame {
+    match transcript {
+        Some(tx) => match ope_crypto::decode(ciphertext_b64url) {
+            Ok(bytes) => match tx.push(&bytes, final_) {
+                Ok(tf) => OpeStreamFrame::ciphertext_with_chain(
+                    seq,
+                    ciphertext_b64url,
+                    final_,
+                    Some(tf.chain),
+                ),
+                Err(_) => OpeStreamFrame::ciphertext(seq, ciphertext_b64url, final_),
+            },
+            Err(_) => OpeStreamFrame::ciphertext(seq, ciphertext_b64url, final_),
+        },
+        None => OpeStreamFrame::ciphertext(seq, ciphertext_b64url, final_),
     }
 }
 
@@ -743,5 +869,38 @@ mod tests {
             "input": "x",
             "messages": [{"role": "user", "content": "hi"}],
         })));
+    }
+
+    #[test]
+    fn ciphertext_frame_omits_chain_without_session() {
+        let frame = ciphertext_frame_with_optional_chain(0, "YQ", true, None);
+        let line = String::from_utf8(encode_ope_stream_line(&frame).unwrap()).unwrap();
+        assert!(!line.contains("\"chain\""));
+        match frame {
+            OpeStreamFrame::Ciphertext { chain, .. } => assert!(chain.is_none()),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ciphertext_frame_attaches_chain_with_session() {
+        let kp = ope_crypto::mock_keypair_from_seed(&[7u8; 32]);
+        let (_signed, mut session) = ResponseTranscriptSession::begin(
+            &kp.secret,
+            "nonce",
+            "engine-1",
+            "epoch-a",
+            "A256GCM",
+        )
+        .unwrap();
+        let ct = ope_crypto::encode(b"cipher-0");
+        let frame = ciphertext_frame_with_optional_chain(0, &ct, true, Some(&mut session));
+        match frame {
+            OpeStreamFrame::Ciphertext { chain, final_, .. } => {
+                assert!(chain.is_some());
+                assert!(final_);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
