@@ -42,11 +42,15 @@ sha256() {
 }
 
 IE_RUNTIME_SHA256="$(sha256 "$TAR_PATH")"
+IE_BINARY_SHA256="$(sha256 "$BIN")"
 OPE_FFI_SHA256="$(python3 -c 'import json; print(json.load(open("'"$ROOT/config/tcb-pins.json"'"))["ope"]["libopeFfiSha256"].lower())')"
 AMT_SHA256="$(python3 -c 'import json; print(json.load(open("'"$ROOT/config/tcb-pins.json"'"))["attestedMtls"]["libAttestedMtlsSha256"].lower())')"
 
+# Clients fingerprint the attested ELF (bin/teechat-inference-engine), not only the tarball.
+# Keep BOTH digests in SHA256SUMS so allowlist / GitHub-release scanners can match either.
 cat >"$OUT_DIR/SHA256SUMS" <<EOF
 ${IE_RUNTIME_SHA256}  ${TAR_NAME}
+${IE_BINARY_SHA256}  bin/teechat-inference-engine
 EOF
 
 python3 - <<PY
@@ -58,13 +62,16 @@ manifest = {
   "tag": f"v$VERSION",
   "ieRuntimeSha256": "$IE_RUNTIME_SHA256",
   "ieRuntimeAsset": "$TAR_NAME",
+  "ieBinarySha256": "$IE_BINARY_SHA256",
+  "ieBinaryAsset": "bin/teechat-inference-engine",
   "opeFfiSha256": "$OPE_FFI_SHA256",
   "attestedMtlsSha256": "$AMT_SHA256",
-  "notes": "Primary measured artifact is inference-engine-runtime-*.tar.gz (engine.binary_sha256). "
+  "notes": "Primary measured artifacts: inference-engine-runtime-*.tar.gz (ieRuntimeSha256) and "
+           "bin/teechat-inference-engine ELF (ieBinarySha256; client attestation fingerprint). "
            "OPE FFI and attested-mtls are independent TCBs from config/tcb-pins.json.",
 }
 (out / "RELEASE_MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")
 PY
 
-echo ">> pack-runtime: ${TAR_NAME} sha256=${IE_RUNTIME_SHA256:0:16}…"
+echo ">> pack-runtime: ${TAR_NAME} sha256=${IE_RUNTIME_SHA256:0:16}… elf=${IE_BINARY_SHA256:0:16}…"
 echo ">> wrote ${OUT_DIR}/SHA256SUMS + RELEASE_MANIFEST.json"
