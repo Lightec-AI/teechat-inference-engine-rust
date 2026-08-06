@@ -42,22 +42,13 @@ url = "2"
 rand = "0.8"
 rcgen = "0.13"
 attested-mtls = "0.1.0"
-ope-crypto = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d412005221abb8c8e6e8cef0e1410407e91dce3b" }
-ope-envelope = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d412005221abb8c8e6e8cef0e1410407e91dce3b" }
-ope-transport = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d412005221abb8c8e6e8cef0e1410407e91dce3b" }
-ope-e2e = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d412005221abb8c8e6e8cef0e1410407e91dce3b" }
+ope-crypto = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d565429a36f389aa165f8efe51f759d4c6116f57" }
+ope-envelope = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d565429a36f389aa165f8efe51f759d4c6116f57" }
+ope-transport = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d565429a36f389aa165f8efe51f759d4c6116f57" }
+ope-e2e = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d565429a36f389aa165f8efe51f759d4c6116f57" }
 ie-protocol = { path = "crates/ie-protocol" }
 ie-crypto = { path = "crates/ie-crypto" }
 ie-attestation = { path = "crates/ie-attestation" }
 ie-engine = { path = "crates/ie-engine" }
 ie-upstream = { path = "crates/ie-upstream" }
 ie-runtime = { path = "crates/ie-runtime" }
-
-# Offline RB-05/06: prefer TeaChat's vendored OPE (chain field + transcript) over git pins.
-# Remove once crates.io / OPE git revs include ciphertext `chain` + matching envelopes.
-[patch."https://github.com/Lightec-AI/OPE.git"]
-ope-protocol = { path = "../TeaChat/vendor/ope/crates/ope-protocol" }
-ope-crypto = { path = "../TeaChat/vendor/ope/crates/ope-crypto" }
-ope-envelope = { path = "../TeaChat/vendor/ope/crates/ope-envelope" }
-ope-transport = { path = "../TeaChat/vendor/ope/crates/ope-transport" }
-ope-e2e = { path = "../TeaChat/vendor/ope/crates/ope-e2e" }
