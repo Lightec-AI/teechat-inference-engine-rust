@@ -13,17 +13,20 @@ use ie_attestation::{
 };
 use ie_crypto::{MockCryptoProvider, RealCryptoProvider};
 use ie_engine::{
-    configure_event_log_from_env, create_pool_connect_throttle_from_env,
+    apply_engine_ops_control, configure_event_log_from_env, create_pool_connect_throttle_from_env,
     engine_instance_id_from_env, epoch_rotation_policy_from_env,
     generate_gateway_connect_challenge_nonce, install_engine_controls,
     mint_engine_challenge_response, platform_policy_verifier_from_env, spawn_desired_pool_applier,
     start_pull_worker, warn_pull_worker_start, DesiredPoolTargetCallback, EngineChallengeEpoch,
-    EngineChallengeHandler, EngineChallengeMeasurement, EnginePlaneDialOptions, EphemeralPoster,
-    EpochEvidenceMinter, EpochRotatedCallback, EpochRotator, EpochRotatorOptions,
-    EpochRotatorSession, Http2EnginePlaneConnector, MintEngineChallengeArgs, OpeInferenceOptions,
-    PullWorkerStartFn, RotatingEpochDecryptor, SupervisedPool, SupervisedPoolConfig,
+    EngineChallengeHandler, EngineChallengeMeasurement, EngineOpsControlHandler,
+    EnginePlaneDialOptions, EphemeralPoster, EpochEvidenceMinter, EpochRotatedCallback,
+    EpochRotator, EpochRotatorOptions, EpochRotatorSession, Http2EnginePlaneConnector,
+    MintEngineChallengeArgs, OpeInferenceOptions, OpsControlRateLimiter, PullWorkerStartFn,
+    RotatingEpochDecryptor, SupervisedPool, SupervisedPoolConfig,
 };
-use ie_protocol::{AttestedConnectRequest, EngineEphemeralRegisterRequest};
+use ie_protocol::{
+    AttestedConnectRequest, EngineEphemeralRegisterRequest, CAPABILITY_OPS_CONTROL_V1,
+};
 use ie_runtime::{engine_plane_client_tls, env_map_from_process, load_engine_env_files};
 use ie_upstream::{
     embed_model_id_from_env, embeddings_config_from_env, max_tokens_from_env,
@@ -218,6 +221,7 @@ fn make_pull_worker_start_fn(
     inference_template: OpeInferenceOptions,
     on_desired: DesiredPoolTargetCallback,
     answer_challenge: EngineChallengeHandler,
+    answer_ops_control: EngineOpsControlHandler,
     pool: Arc<SupervisedPool>,
 ) -> PullWorkerStartFn {
     Arc::new(move |session_id: String| {
@@ -225,6 +229,7 @@ fn make_pull_worker_start_fn(
         let inference = clone_inference_options(&inference_template);
         let on_desired = Arc::clone(&on_desired);
         let answer_challenge = Arc::clone(&answer_challenge);
+        let answer_ops_control = Arc::clone(&answer_ops_control);
         let pool = Arc::clone(&pool);
         Box::pin(async move {
             let transport = h2
@@ -243,6 +248,7 @@ fn make_pull_worker_start_fn(
                 inference,
                 Some(on_desired),
                 Some(answer_challenge),
+                Some(answer_ops_control),
                 Some(on_lost),
             ))
         })
@@ -312,6 +318,33 @@ fn make_engine_challenge_handler(
             })
             .await
             .map_err(|error| format!("challenge_mint_join: {error}"))?
+        })
+    })
+}
+
+fn make_engine_ops_control_handler(
+    pool: Arc<SupervisedPool>,
+    engine_id: String,
+    rate: Arc<OpsControlRateLimiter>,
+) -> EngineOpsControlHandler {
+    Arc::new(move |request| {
+        let pool = Arc::clone(&pool);
+        let engine_id = engine_id.clone();
+        let rate = Arc::clone(&rate);
+        Box::pin(async move {
+            if let Err(error) = rate.check(request.op).await {
+                return ie_protocol::EngineOpsControlResult {
+                    ok: false,
+                    op: request.op,
+                    engine_id,
+                    pool_target: None,
+                    live_sessions: Some(pool.live_session_count().await),
+                    draining: None,
+                    detail: None,
+                    error: Some(error.to_string()),
+                };
+            }
+            apply_engine_ops_control(&pool, &engine_id, request).await
         })
     })
 }
@@ -490,8 +523,8 @@ async fn run_engine(
         pool_target_size: Some(pool_target_size),
         instance_id: Some(instance_id.clone()),
         gateway_challenge_nonce: Some(challenge.clone()),
-        // Advertised when ops_control pull handler is wired (Phase 2a).
-        capabilities: None,
+        // Phase 2a: advertise ops_control_v1 only with pull handler wired below.
+        capabilities: Some(vec![CAPABILITY_OPS_CONTROL_V1.to_string()]),
     };
 
     type LivePlane = (
@@ -699,6 +732,11 @@ async fn run_engine(
         let on_desired = spawn_desired_pool_applier(Arc::clone(&pool), pool_config.clone());
         let answer_challenge =
             make_engine_challenge_handler(Arc::clone(&rotator), env.clone(), engine_id.clone());
+        let answer_ops_control = make_engine_ops_control_handler(
+            Arc::clone(&pool),
+            engine_id.clone(),
+            Arc::new(OpsControlRateLimiter::default_prod()),
+        );
         pool.set_on_session_ready(Some({
             let rotator = Arc::clone(&rotator);
             Arc::new(move |session_id: String| {
@@ -717,6 +755,7 @@ async fn run_engine(
             inference_template,
             on_desired,
             answer_challenge,
+            answer_ops_control,
             Arc::clone(&pool),
         )))
         .await;

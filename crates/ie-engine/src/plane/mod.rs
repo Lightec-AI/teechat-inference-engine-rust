@@ -8,6 +8,7 @@ mod ephemeral;
 mod error;
 mod gateway_platform_verify;
 mod hyper_transport;
+mod ops_control;
 mod pull;
 mod session;
 mod verify;
@@ -27,8 +28,12 @@ pub use disconnect::{
 pub use ephemeral::post_ephemeral_on_attested_session;
 pub use error::PlaneError;
 pub use gateway_platform_verify::platform_policy_verifier_from_env;
+pub use ops_control::{
+    apply_engine_ops_control, validate_ops_control_request, OpsControlRateLimiter,
+};
 pub use pull::{
-    start_pull_worker, EngineChallengeHandler, EngineChallengeHandlerFuture, PullWorkerHandle,
+    start_pull_worker, EngineChallengeHandler, EngineChallengeHandlerFuture,
+    EngineOpsControlHandler, EngineOpsControlHandlerFuture, PullWorkerHandle,
 };
 pub use session::{
     AttestedH2Session, H2BytesResponse, H2JsonResponse, PlaneTransport, StreamingPostHandle,

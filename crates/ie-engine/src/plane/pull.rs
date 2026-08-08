@@ -6,11 +6,12 @@ use std::time::Duration;
 use std::{future::Future, pin::Pin};
 
 use ie_protocol::{
-    traffic_class_header_meta_consistent, OpeEnvelope, TrafficClassConsistency,
-    CONTENT_TYPE_OPE_JSON, CONTENT_TYPE_OPE_JSON_STREAM, ENGINE_PLANE_PATH_CHALLENGE_RESULT,
-    ENGINE_PLANE_PATH_INFERENCE_RESULT, ENGINE_PLANE_PATH_WORK_PULL, HEADER_OPE_REQUEST_ID,
+    traffic_class_header_meta_consistent, EngineOpsControlRequest, EngineOpsControlResult,
+    OpeEnvelope, TrafficClassConsistency, CONTENT_TYPE_OPE_JSON, CONTENT_TYPE_OPE_JSON_STREAM,
+    ENGINE_PLANE_PATH_CHALLENGE_RESULT, ENGINE_PLANE_PATH_INFERENCE_RESULT,
+    ENGINE_PLANE_PATH_OPS_CONTROL_RESULT, ENGINE_PLANE_PATH_WORK_PULL, HEADER_OPE_REQUEST_ID,
     HEADER_OPE_SESSION_ID, HEADER_OPE_TRAFFIC_CLASS, HEADER_OPE_WORK_KIND, HEADER_USAGE_REPORT,
-    OPE_WORK_KIND_CHALLENGE,
+    OPE_WORK_KIND_CHALLENGE, OPE_WORK_KIND_OPS_CONTROL,
 };
 use tokio::sync::Notify;
 use tracing::{info, warn};
@@ -32,6 +33,11 @@ pub type EngineChallengeHandlerFuture = Pin<
 >;
 pub type EngineChallengeHandler =
     Arc<dyn Fn(crate::EngineChallengeWireRequest) -> EngineChallengeHandlerFuture + Send + Sync>;
+
+pub type EngineOpsControlHandlerFuture =
+    Pin<Box<dyn Future<Output = EngineOpsControlResult> + Send + 'static>>;
+pub type EngineOpsControlHandler =
+    Arc<dyn Fn(EngineOpsControlRequest) -> EngineOpsControlHandlerFuture + Send + Sync>;
 
 pub struct PullWorkerHandle {
     stop: Arc<AtomicBool>,
@@ -63,6 +69,7 @@ pub fn start_pull_worker(
     inference: OpeInferenceOptions,
     on_desired_pool_target: Option<DesiredPoolTargetCallback>,
     answer_challenge: Option<EngineChallengeHandler>,
+    answer_ops_control: Option<EngineOpsControlHandler>,
     on_transport_lost: Option<crate::pull_workers::TransportLostFn>,
 ) -> PullWorkerHandle {
     let stop = Arc::new(AtomicBool::new(false));
@@ -87,6 +94,7 @@ pub fn start_pull_worker(
                 busy_c.clone(),
                 on_desired_pool_target.as_ref(),
                 answer_challenge.as_ref(),
+                answer_ops_control.as_ref(),
             )
             .await
             {
@@ -180,6 +188,66 @@ async fn answer_challenge_work(
     Ok(WorkPullOutcome::Processed)
 }
 
+async fn answer_ops_control_work(
+    transport: &dyn PlaneTransport,
+    session_id: &str,
+    request_id: &str,
+    body: &[u8],
+    answer_ops_control: Option<&EngineOpsControlHandler>,
+) -> Result<WorkPullOutcome, PlaneError> {
+    let result = match serde_json::from_slice::<EngineOpsControlRequest>(body) {
+        Ok(request) => match answer_ops_control {
+            Some(handler) => handler(request).await,
+            None => EngineOpsControlResult {
+                ok: false,
+                op: request.op,
+                engine_id: String::new(),
+                pool_target: None,
+                live_sessions: None,
+                draining: None,
+                detail: None,
+                error: Some("ops_control_handler_unavailable".into()),
+            },
+        },
+        Err(err) => EngineOpsControlResult {
+            ok: false,
+            op: ie_protocol::EngineOpsControlOp::Status,
+            engine_id: String::new(),
+            pool_target: None,
+            live_sessions: None,
+            draining: None,
+            detail: None,
+            error: Some(format!("ops_control_request_json: {err}")),
+        },
+    };
+
+    let status: u16 = if result.ok { 200 } else { 500 };
+    let response_body = serde_json::to_vec(&result).map_err(PlaneError::Json)?;
+    let status_header = status.to_string();
+    let headers = [
+        (HEADER_OPE_SESSION_ID, session_id),
+        (HEADER_OPE_REQUEST_ID, request_id),
+        ("x-ope-status", status_header.as_str()),
+    ];
+    let post = transport
+        .request_bytes(
+            "POST",
+            ENGINE_PLANE_PATH_OPS_CONTROL_RESULT,
+            Some(&response_body),
+            Some("application/json"),
+            &headers,
+        )
+        .await?;
+    if post.status >= 400 {
+        warn!(
+            status = post.status,
+            request_id, "ops_control result rejected"
+        );
+    }
+    info!(request_id, status, ok = result.ok, "engine ops_control work answered");
+    Ok(WorkPullOutcome::Processed)
+}
+
 async fn pull_once(
     transport: &dyn PlaneTransport,
     session_id: &str,
@@ -187,6 +255,7 @@ async fn pull_once(
     busy: Arc<AtomicBool>,
     on_desired_pool_target: Option<&DesiredPoolTargetCallback>,
     answer_challenge: Option<&EngineChallengeHandler>,
+    answer_ops_control: Option<&EngineOpsControlHandler>,
 ) -> Result<WorkPullOutcome, PlaneError> {
     let resp = transport
         .request_bytes(
@@ -226,6 +295,20 @@ async fn pull_once(
             &request_id,
             &resp.body,
             answer_challenge,
+        )
+        .await;
+        busy.store(false, Ordering::SeqCst);
+        return result;
+    }
+
+    if resp.header_value(HEADER_OPE_WORK_KIND) == Some(OPE_WORK_KIND_OPS_CONTROL) {
+        busy.store(true, Ordering::SeqCst);
+        let result = answer_ops_control_work(
+            transport,
+            session_id,
+            &request_id,
+            &resp.body,
+            answer_ops_control,
         )
         .await;
         busy.store(false, Ordering::SeqCst);
@@ -423,8 +506,9 @@ mod tests {
     use bytes::Bytes;
     use ie_crypto::{CryptoProvider, MockCryptoProvider};
     use ie_protocol::{
-        CpuTeeEndorsement, ENGINE_PLANE_PATH_CHALLENGE_RESULT, HEADER_OPE_WORK_KIND,
-        OPE_WORK_KIND_CHALLENGE,
+        CpuTeeEndorsement, EngineOpsControlOp, EngineOpsControlRequest, EngineOpsControlResult,
+        ENGINE_PLANE_PATH_CHALLENGE_RESULT, ENGINE_PLANE_PATH_OPS_CONTROL_RESULT,
+        HEADER_OPE_WORK_KIND, OPE_WORK_KIND_CHALLENGE, OPE_WORK_KIND_OPS_CONTROL,
     };
     use std::sync::Mutex;
 
@@ -477,6 +561,21 @@ mod tests {
                 ));
                 return Ok(H2BytesResponse {
                     status: 200,
+                    headers: vec![],
+                    body: Bytes::new(),
+                });
+            }
+            if method == "POST" && path == ENGINE_PLANE_PATH_OPS_CONTROL_RESULT {
+                *self.posted.lock().unwrap() = Some((
+                    path.to_string(),
+                    headers
+                        .iter()
+                        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                        .collect(),
+                    Bytes::copy_from_slice(body.unwrap_or_default()),
+                ));
+                return Ok(H2BytesResponse {
+                    status: 204,
                     headers: vec![],
                     body: Bytes::new(),
                 });
@@ -583,6 +682,7 @@ mod tests {
             Arc::clone(&busy),
             None,
             Some(&handler),
+            None,
         )
         .await
         .expect("challenge work");
@@ -602,5 +702,172 @@ mod tests {
             .any(|(name, value)| name == "x-ope-status" && value == "200"));
         let response: EngineChallengeWireResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(response.challenge_nonce_b64, nonce_b64);
+    }
+
+    #[tokio::test]
+    async fn ops_control_work_posts_result_without_parsing_an_ope_envelope() {
+        let transport = ChallengeTransport {
+            pull: Mutex::new(Some(H2BytesResponse {
+                status: 200,
+                headers: vec![
+                    (HEADER_OPE_REQUEST_ID.into(), "req-ops".into()),
+                    (HEADER_OPE_WORK_KIND.into(), OPE_WORK_KIND_OPS_CONTROL.into()),
+                ],
+                body: Bytes::from(
+                    serde_json::to_vec(&EngineOpsControlRequest {
+                        op: EngineOpsControlOp::ForceTarget,
+                        target_size: Some(8),
+                        drain_fraction: None,
+                        drain_count: None,
+                        migrate_url: None,
+                        migrate_fraction: None,
+                        confirm: None,
+                    })
+                    .unwrap(),
+                ),
+            })),
+            posted: Mutex::new(None),
+        };
+        let handler: EngineOpsControlHandler = Arc::new(|request| {
+            assert_eq!(request.op, EngineOpsControlOp::ForceTarget);
+            assert_eq!(request.target_size, Some(8));
+            Box::pin(async move {
+                EngineOpsControlResult {
+                    ok: true,
+                    op: request.op,
+                    engine_id: "eng-1".into(),
+                    pool_target: request.target_size,
+                    live_sessions: Some(8),
+                    draining: None,
+                    detail: Some("forced_to_8".into()),
+                    error: None,
+                }
+            })
+        });
+        let busy = Arc::new(AtomicBool::new(false));
+
+        let outcome = pull_once(
+            &transport,
+            "sess-1",
+            &inference_options(),
+            Arc::clone(&busy),
+            None,
+            None,
+            Some(&handler),
+        )
+        .await
+        .expect("ops_control work");
+        assert!(matches!(outcome, WorkPullOutcome::Processed));
+        assert!(!busy.load(Ordering::SeqCst));
+
+        let (path, headers, body) = transport.posted.lock().unwrap().clone().expect("result");
+        assert_eq!(path, ENGINE_PLANE_PATH_OPS_CONTROL_RESULT);
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == HEADER_OPE_SESSION_ID && value == "sess-1"));
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == HEADER_OPE_REQUEST_ID && value == "req-ops"));
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "x-ope-status" && value == "200"));
+        let response: EngineOpsControlResult = serde_json::from_slice(&body).unwrap();
+        assert!(response.ok);
+        assert_eq!(response.pool_target, Some(8));
+        assert_eq!(response.engine_id, "eng-1");
+    }
+
+    #[tokio::test]
+    async fn ops_control_posts_error_result_when_handler_missing() {
+        let transport = ChallengeTransport {
+            pull: Mutex::new(Some(H2BytesResponse {
+                status: 200,
+                headers: vec![
+                    (HEADER_OPE_REQUEST_ID.into(), "req-ops-missing".into()),
+                    (HEADER_OPE_WORK_KIND.into(), OPE_WORK_KIND_OPS_CONTROL.into()),
+                ],
+                body: Bytes::from(
+                    serde_json::to_vec(&EngineOpsControlRequest {
+                        op: EngineOpsControlOp::Status,
+                        target_size: None,
+                        drain_fraction: None,
+                        drain_count: None,
+                        migrate_url: None,
+                        migrate_fraction: None,
+                        confirm: None,
+                    })
+                    .unwrap(),
+                ),
+            })),
+            posted: Mutex::new(None),
+        };
+        let busy = Arc::new(AtomicBool::new(false));
+        let outcome = pull_once(
+            &transport,
+            "sess-1",
+            &inference_options(),
+            Arc::clone(&busy),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("ops_control without handler");
+        assert!(matches!(outcome, WorkPullOutcome::Processed));
+        let (path, headers, body) = transport.posted.lock().unwrap().clone().expect("result");
+        assert_eq!(path, ENGINE_PLANE_PATH_OPS_CONTROL_RESULT);
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "x-ope-status" && value == "500"));
+        let response: EngineOpsControlResult = serde_json::from_slice(&body).unwrap();
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some("ops_control_handler_unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn ops_control_posts_error_result_for_invalid_json() {
+        let transport = ChallengeTransport {
+            pull: Mutex::new(Some(H2BytesResponse {
+                status: 200,
+                headers: vec![
+                    (HEADER_OPE_REQUEST_ID.into(), "req-ops-bad".into()),
+                    (HEADER_OPE_WORK_KIND.into(), OPE_WORK_KIND_OPS_CONTROL.into()),
+                ],
+                body: Bytes::from_static(b"{not-json"),
+            })),
+            posted: Mutex::new(None),
+        };
+        let handler: EngineOpsControlHandler = Arc::new(|_| {
+            Box::pin(async {
+                panic!("handler must not run on invalid json");
+            })
+        });
+        let busy = Arc::new(AtomicBool::new(false));
+        let outcome = pull_once(
+            &transport,
+            "sess-1",
+            &inference_options(),
+            Arc::clone(&busy),
+            None,
+            None,
+            Some(&handler),
+        )
+        .await
+        .expect("ops_control bad json");
+        assert!(matches!(outcome, WorkPullOutcome::Processed));
+        let (_, headers, body) = transport.posted.lock().unwrap().clone().expect("result");
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "x-ope-status" && value == "500"));
+        let response: EngineOpsControlResult = serde_json::from_slice(&body).unwrap();
+        assert!(!response.ok);
+        assert!(response
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("ops_control_request_json:"));
     }
 }

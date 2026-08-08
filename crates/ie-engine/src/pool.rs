@@ -132,6 +132,7 @@ impl SupervisedPool {
         Self {
             config,
             gateway_base_url: RwLock::new(gateway_base_url.into()),
+
             connector,
             upstream,
             connect_template: RwLock::new(None),
@@ -158,6 +159,10 @@ impl SupervisedPool {
 
     pub fn connect_throttle(&self) -> &PoolConnectThrottle {
         self.connect_throttle.as_ref()
+    }
+
+    pub fn config(&self) -> &SupervisedPoolConfig {
+        &self.config
     }
 
     /// Install / replace attestation remint used on scale + migrate (+ reconnect paths).
