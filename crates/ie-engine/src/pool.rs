@@ -1065,6 +1065,7 @@ mod tests {
             pool_target_size: None,
             instance_id: None,
             gateway_challenge_nonce: None,
+            capabilities: None,
         }
     }
 

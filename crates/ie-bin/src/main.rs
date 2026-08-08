@@ -490,6 +490,8 @@ async fn run_engine(
         pool_target_size: Some(pool_target_size),
         instance_id: Some(instance_id.clone()),
         gateway_challenge_nonce: Some(challenge.clone()),
+        // Advertised when ops_control pull handler is wired (Phase 2a).
+        capabilities: None,
     };
 
     type LivePlane = (

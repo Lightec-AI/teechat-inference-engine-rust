@@ -42,10 +42,10 @@ url = "2"
 rand = "0.8"
 rcgen = "0.13"
 attested-mtls = "0.1.0"
-ope-crypto = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d565429a36f389aa165f8efe51f759d4c6116f57" }
-ope-envelope = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d565429a36f389aa165f8efe51f759d4c6116f57" }
-ope-transport = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d565429a36f389aa165f8efe51f759d4c6116f57" }
-ope-e2e = { git = "https://github.com/Lightec-AI/OPE.git", rev = "d565429a36f389aa165f8efe51f759d4c6116f57" }
+ope-crypto = { git = "https://github.com/Lightec-AI/OPE.git", rev = "52c47921b98e5b9d6ce6f77aa340a6b583f3fc48" }
+ope-envelope = { git = "https://github.com/Lightec-AI/OPE.git", rev = "52c47921b98e5b9d6ce6f77aa340a6b583f3fc48" }
+ope-transport = { git = "https://github.com/Lightec-AI/OPE.git", rev = "52c47921b98e5b9d6ce6f77aa340a6b583f3fc48" }
+ope-e2e = { git = "https://github.com/Lightec-AI/OPE.git", rev = "52c47921b98e5b9d6ce6f77aa340a6b583f3fc48" }
 ie-protocol = { path = "crates/ie-protocol" }
 ie-crypto = { path = "crates/ie-crypto" }
 ie-attestation = { path = "crates/ie-attestation" }
