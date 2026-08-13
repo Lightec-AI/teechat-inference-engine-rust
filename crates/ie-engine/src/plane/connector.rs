@@ -172,6 +172,25 @@ impl EnginePlaneConnector for Http2EnginePlaneConnector {
             .await
     }
 
+    async fn disconnect_for_shutdown(
+        &self,
+        session_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.disconnect_with_reason(session_id, AttestedDisconnectReason::Shutdown)
+            .await
+    }
+
+    async fn force_close_all(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let sessions: Vec<_> = {
+            let mut map = self.sessions.lock().await;
+            map.drain().map(|(_, session)| session).collect()
+        };
+        for session in sessions {
+            let _ = session.close().await;
+        }
+        Ok(())
+    }
+
     async fn is_session_closed(&self, session_id: &str) -> bool {
         match self.sessions.lock().await.get(session_id) {
             Some(session) => session.transport().is_closed(),

@@ -4,7 +4,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::RwLock;
+use tokio::time::timeout;
 use tracing::{info, warn};
+
+use futures::future::join_all;
 
 use ie_protocol::{AttestationBundle, AttestedConnectRequest};
 
@@ -927,17 +930,39 @@ impl SupervisedPool {
     }
 
     pub async fn close_all(&self) -> Result<(), EngineError> {
+        self.close_all_with_timeout(Duration::from_secs(15)).await
+    }
+
+    /// Stop pull workers, POST disconnect in parallel, then force-drop leftover H2
+    /// transports. Bounded so systemd `TimeoutStopSec=120` is not spent waiting on
+    /// a half-open QEMU user-net socket.
+    pub async fn close_all_with_timeout(&self, disconnect_timeout: Duration) -> Result<(), EngineError> {
         self.closed.store(true, Ordering::SeqCst);
         if let Some(handle) = self.watch_task.write().await.take() {
             handle.abort();
         }
         let ids: Vec<String> = self.session_ids().await;
-        for id in ids {
-            self.suppress_reconnect(&id).await;
-            self.workers.stop_session(&id).await;
-            if let Err(err) = self.connector.disconnect(&id).await {
-                warn!(session_id = %id, error = %err, "disconnect failed during pool close");
+        for id in &ids {
+            self.suppress_reconnect(id).await;
+            self.workers.stop_session(id).await;
+        }
+        let futs = ids.iter().map(|id| {
+            let connector = Arc::clone(&self.connector);
+            let id = id.clone();
+            async move {
+                if let Err(err) = connector.disconnect_for_shutdown(&id).await {
+                    warn!(session_id = %id, error = %err, "disconnect failed during pool close");
+                }
             }
+        });
+        if timeout(disconnect_timeout, join_all(futs)).await.is_err() {
+            warn!(
+                timeout_ms = disconnect_timeout.as_millis() as u64,
+                "pool close disconnect timed out; force-closing leftover transports"
+            );
+        }
+        if let Err(err) = self.connector.force_close_all().await {
+            warn!(error = %err, "force_close_all failed during pool close");
         }
         self.workers.stop_all().await;
         self.state.write().await.slots.clear();
@@ -1408,6 +1433,105 @@ mod tests {
         pool.notify_transport_lost("drain-1");
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(connector.reconnects.load(Ordering::SeqCst), 0);
+        assert!(pool.session_ids().await.is_empty());
+    }
+
+    struct SlowDisconnectConnector {
+        disconnect_ms: u64,
+        shutdown_disconnects: AtomicU32,
+        force_closes: AtomicU32,
+    }
+
+    impl SlowDisconnectConnector {
+        fn new(disconnect_ms: u64) -> Self {
+            Self {
+                disconnect_ms,
+                shutdown_disconnects: AtomicU32::new(0),
+                force_closes: AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EnginePlaneConnector for SlowDisconnectConnector {
+        async fn connect(
+            &self,
+            request: AttestedConnectRequest,
+        ) -> Result<ConnectResult, Box<dyn std::error::Error + Send + Sync>> {
+            let sid = if request.session_id.is_empty() {
+                format!("sess-{}", NEXT_ID.fetch_add(1, Ordering::SeqCst))
+            } else {
+                format!(
+                    "{}-{}",
+                    request.session_id,
+                    NEXT_ID.fetch_add(1, Ordering::SeqCst)
+                )
+            };
+            Ok(ConnectResult {
+                session_id: sid,
+                response: AttestedConnectResponse {
+                    ok: true,
+                    gateway_attestation: None,
+                    pool_target_ack: Some(1),
+                    gateway_challenge_nonce: None,
+                },
+            })
+        }
+
+        async fn disconnect(
+            &self,
+            _session_id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+
+        async fn disconnect_for_shutdown(
+            &self,
+            _session_id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.shutdown_disconnects.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(self.disconnect_ms)).await;
+            Ok(())
+        }
+
+        async fn force_close_all(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.force_closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn close_all_with_timeout_force_closes_slow_disconnect() {
+        let connector = Arc::new(SlowDisconnectConnector::new(5_000));
+        let pool = test_pool(
+            SupervisedPoolConfig {
+                pool_target_size: 2,
+                pool_initial_fraction: 1.0,
+                pool_initial_fraction_explicit: true,
+                pool_baseline: 2,
+                supervised: true,
+                reconnect: PoolReconnectConfig::default(),
+            },
+            "https://gateway.example",
+            connector.clone() as Arc<dyn EnginePlaneConnector>,
+        );
+        pool.boot(sample_request()).await.unwrap();
+        assert_eq!(pool.session_ids().await.len(), 2);
+
+        let started = tokio::time::Instant::now();
+        pool.close_all_with_timeout(Duration::from_millis(80))
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "close_all_with_timeout blocked for {:?}",
+            started.elapsed()
+        );
+        assert!(
+            connector.shutdown_disconnects.load(Ordering::SeqCst) >= 1,
+            "expected disconnect_for_shutdown"
+        );
+        assert_eq!(connector.force_closes.load(Ordering::SeqCst), 1);
         assert!(pool.session_ids().await.is_empty());
     }
 }

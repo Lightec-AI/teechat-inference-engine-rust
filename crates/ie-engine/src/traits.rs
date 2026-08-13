@@ -44,6 +44,19 @@ pub trait EnginePlaneConnector: Send + Sync {
         session_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+    /// Graceful teardown on process stop (SIGTERM / Ctrl+C). Default: [`Self::disconnect`].
+    async fn disconnect_for_shutdown(
+        &self,
+        session_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.disconnect(session_id).await
+    }
+
+    /// Drop remaining H2 transports after a bounded shutdown (best-effort).
+    async fn force_close_all(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
     /// True when the live H2 transport for `session_id` is gone (or unknown).
     async fn is_session_closed(&self, _session_id: &str) -> bool {
         false

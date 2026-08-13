@@ -35,9 +35,10 @@ use ie_upstream::{
 };
 use ope_crypto::{encode, mock_keypair_from_seed, DEV_VECTOR_001_SEED};
 use rand::rngs::OsRng;
-use tokio::signal;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+
+mod shutdown;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -811,7 +812,7 @@ async fn run_engine(
     );
     println!("[inference-engine] supervised pool running — Ctrl+C to stop");
 
-    signal::ctrl_c().await?;
+    shutdown::wait_shutdown_signal().await;
     if let Some(task) = prune_task {
         task.abort();
     }
