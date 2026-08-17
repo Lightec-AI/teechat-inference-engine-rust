@@ -4,10 +4,23 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use crate::error::AttestationError;
+use crate::process_timeout::command_output_timed;
 
-pub fn sev_snp_guest_bin_from_env(env: &HashMap<String, String>) -> Result<String, AttestationError> {
+fn snpguest_timeout(env: &HashMap<String, String>) -> Duration {
+    let secs = env
+        .get("TEECHAT_SNPGUEST_TIMEOUT_SECS")
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(60);
+    Duration::from_secs(secs)
+}
+
+pub fn sev_snp_guest_bin_from_env(
+    env: &HashMap<String, String>,
+) -> Result<String, AttestationError> {
     let raw = env
         .get("TEECHAT_SNP_GUEST_BIN")
         .map(|s| s.trim())
@@ -50,9 +63,9 @@ pub fn is_sev_snp_guest_tool_available(env: &HashMap<String, String>) -> bool {
     let Ok(bin) = sev_snp_guest_bin_from_env(env) else {
         return false;
     };
-    Command::new(&bin)
-        .arg("--version")
-        .output()
+    let mut cmd = Command::new(&bin);
+    cmd.arg("--version");
+    command_output_timed(cmd, Duration::from_secs(15), &bin)
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -91,14 +104,18 @@ pub fn request_sev_snp_attestation_report(
         path: req_path.display().to_string(),
         source,
     })?;
-    let status = Command::new(&bin)
-        .args(["report", report_path.to_str().unwrap(), req_path.to_str().unwrap()])
-        .status()
-        .map_err(|source| AttestationError::ToolInvoke {
-            bin: bin.clone(),
-            source,
-        })?;
-    if !status.success() {
+    eprintln!(
+        "[inference-engine] snpguest report bin={bin} timeout={}s",
+        snpguest_timeout(env).as_secs()
+    );
+    let mut cmd = Command::new(&bin);
+    cmd.args([
+        "report",
+        report_path.to_str().unwrap(),
+        req_path.to_str().unwrap(),
+    ]);
+    let output = command_output_timed(cmd, snpguest_timeout(env), &bin)?;
+    if !output.status.success() {
         return Err(AttestationError::ToolFailed { bin });
     }
     fs::read(&report_path).map_err(|source| AttestationError::Io {

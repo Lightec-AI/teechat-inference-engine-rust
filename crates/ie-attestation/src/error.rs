@@ -4,7 +4,9 @@ use thiserror::Error;
 pub enum AttestationError {
     #[error("missing engine runtime measurement: set TEECHAT_ENGINE_BINARY_SHA256 / TEECHAT_IE_RUNTIME_SHA256 or RELEASE_MANIFEST.json ieRuntimeSha256")]
     MissingEngineSha,
-    #[error("missing vLLM measurement: set TEECHAT_VLLM_BINARY_SHA256 or TEECHAT_VLLM_BINARY_PATH")]
+    #[error(
+        "missing vLLM measurement: set TEECHAT_VLLM_BINARY_SHA256 or TEECHAT_VLLM_BINARY_PATH"
+    )]
     MissingVllmSha,
     #[error("failed to read {path}: {source}")]
     Io {
@@ -30,9 +32,15 @@ pub enum AttestationError {
     },
     #[error("tool {bin} failed")]
     ToolFailed { bin: String },
-    #[error("invalid TEECHAT_SNP_GUEST_BIN (allow snpguest or /usr/bin|/usr/local/bin/snpguest): {0}")]
+    #[error("tool {bin} timed out after {timeout_secs}s")]
+    ToolTimedOut { bin: String, timeout_secs: u64 },
+    #[error(
+        "invalid TEECHAT_SNP_GUEST_BIN (allow snpguest or /usr/bin|/usr/local/bin/snpguest): {0}"
+    )]
     InvalidSnpGuestBin(String),
-    #[error("invalid TEECHAT_NVATTEST_BIN (allow nvattest or /usr/bin|/usr/local/bin/nvattest): {0}")]
+    #[error(
+        "invalid TEECHAT_NVATTEST_BIN (allow nvattest or /usr/bin|/usr/local/bin/nvattest): {0}"
+    )]
     InvalidNvattestBin(String),
     #[error("gpu_cc_mode_off")]
     GpuCcModeOff,

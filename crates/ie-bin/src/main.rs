@@ -95,8 +95,12 @@ async fn main() {
     }
 
     if cli.run {
+        eprintln!(
+            "[inference-engine] --run enter version={VERSION} cwd={}",
+            cli.cwd
+        );
         if let Err(err) = run_engine(&cli.cwd, &env).await {
-            eprintln!("engine failed: {err}");
+            eprintln!("[inference-engine] --run failed: {err}");
             std::process::exit(1);
         }
         return;
@@ -457,6 +461,9 @@ async fn run_engine(
     let models = models_from_env(env);
     let force_stub = env_flag_true(env, "TEECHAT_ENGINE_STUB");
     let instance_id = engine_instance_id_from_env(env)?;
+    eprintln!(
+        "[inference-engine] --run config engine_id={engine_id} gateway={gateway} stub={force_stub} pool={pool_target_size} upstream={upstream_base}"
+    );
 
     if env_flag_false(env, "TEECHAT_ENGINE_TLS_REJECT_UNAUTHORIZED") && !force_stub {
         return Err(
@@ -501,7 +508,12 @@ async fn run_engine(
         Some(tls) => tls.client_cert_sha256.clone(),
         None => "0".repeat(64),
     };
+    eprintln!(
+        "[inference-engine] tls material ready stub={force_stub} cert_sha={:.16}…",
+        tls_cert_sha
+    );
 
+    eprintln!("[inference-engine] building attestation bundle (snp+gpu)…");
     let attestation = build_engine_attestation_bundle(
         env,
         Path::new(cwd),
@@ -509,6 +521,7 @@ async fn run_engine(
         &tls_cert_sha,
         None,
     )?;
+    eprintln!("[inference-engine] attestation ready; dialing {gateway}");
 
     let challenge = generate_gateway_connect_challenge_nonce();
     let connect = AttestedConnectRequest {

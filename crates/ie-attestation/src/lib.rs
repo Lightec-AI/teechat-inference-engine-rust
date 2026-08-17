@@ -10,6 +10,7 @@ mod mock_quote;
 mod nv_cc;
 mod platform;
 mod policy;
+mod process_timeout;
 mod refresh;
 mod sev_snp;
 mod tcb_pins;

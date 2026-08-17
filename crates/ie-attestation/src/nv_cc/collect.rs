@@ -8,8 +8,26 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::error::AttestationError;
+use crate::process_timeout::command_output_timed;
 
 use super::mock::{build_gpu_not_applicable_evidence, encode_legacy_mock_gpu_evidence};
+
+fn nvidia_smi_timeout(env: &HashMap<String, String>) -> Duration {
+    env_timeout_secs(env, "TEECHAT_NVIDIA_SMI_TIMEOUT_SECS", 45)
+}
+
+fn nvattest_timeout(env: &HashMap<String, String>) -> Duration {
+    env_timeout_secs(env, "TEECHAT_NVATTEST_TIMEOUT_SECS", 120)
+}
+
+fn env_timeout_secs(env: &HashMap<String, String>, key: &str, default: u64) -> Duration {
+    let secs = env
+        .get(key)
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default);
+    Duration::from_secs(secs)
+}
 
 fn nvidia_smi_bin(env: &HashMap<String, String>) -> String {
     env.get("TEECHAT_NVIDIA_SMI_BIN")
@@ -66,8 +84,10 @@ fn mock_allowed(env: &HashMap<String, String>) -> bool {
         .get("TEECHAT_ENV")
         .map(|s| s.trim().to_ascii_lowercase())
         .unwrap_or_default();
-    matches!(kind.as_str(), "development" | "dev" | "test" | "staging" | "")
-        || env_flag_true(env, "TEECHAT_ENGINE_STUB")
+    matches!(
+        kind.as_str(),
+        "development" | "dev" | "test" | "staging" | ""
+    ) || env_flag_true(env, "TEECHAT_ENGINE_STUB")
 }
 
 fn should_use_real_gpu_collector(env: &HashMap<String, String>) -> bool {
@@ -84,16 +104,17 @@ fn should_use_real_gpu_collector(env: &HashMap<String, String>) -> bool {
     !mock_allowed(env)
 }
 
-fn read_conf_compute_state(env: &HashMap<String, String>) -> Value {
+fn read_conf_compute_state(env: &HashMap<String, String>) -> Result<Value, AttestationError> {
     let bin = nvidia_smi_bin(env);
-    let output = Command::new(&bin)
-        .args(["conf-compute", "-q"])
-        .output();
-    let Ok(output) = output else {
-        return json!({ "enabled": false });
-    };
+    let mut cmd = Command::new(&bin);
+    cmd.args(["conf-compute", "-q"]);
+    eprintln!(
+        "[inference-engine] nvidia-smi conf-compute -q bin={bin} timeout={}s",
+        nvidia_smi_timeout(env).as_secs()
+    );
+    let output = command_output_timed(cmd, nvidia_smi_timeout(env), &bin)?;
     if !output.status.success() {
-        return json!({ "enabled": false });
+        return Ok(json!({ "enabled": false }));
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let enabled = text.lines().any(|l| {
@@ -108,7 +129,7 @@ fn read_conf_compute_state(env: &HashMap<String, String>) -> Value {
     if let Some(environment) = capture_field(&text, "Environment") {
         cc["environment"] = json!(environment);
     }
-    cc
+    Ok(cc)
 }
 
 fn capture_field(text: &str, label: &str) -> Option<String> {
@@ -125,20 +146,22 @@ fn capture_field(text: &str, label: &str) -> Option<String> {
     None
 }
 
-fn has_cc_capable_gpu(env: &HashMap<String, String>) -> bool {
+fn has_cc_capable_gpu(env: &HashMap<String, String>) -> Result<bool, AttestationError> {
     let bin = nvidia_smi_bin(env);
-    if Command::new(&bin)
-        .arg("-L")
-        .output()
-        .map(|o| !o.status.success())
-        .unwrap_or(true)
-    {
-        return false;
+    let mut cmd = Command::new(&bin);
+    cmd.arg("-L");
+    eprintln!(
+        "[inference-engine] nvidia-smi -L bin={bin} timeout={}s",
+        nvidia_smi_timeout(env).as_secs()
+    );
+    let output = command_output_timed(cmd, nvidia_smi_timeout(env), &bin)?;
+    if !output.status.success() {
+        return Ok(false);
     }
-    read_conf_compute_state(env)
+    Ok(read_conf_compute_state(env)?
         .get("enabled")
         .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+        .unwrap_or(false))
 }
 
 fn encode_envelope(envelope: &Value) -> String {
@@ -164,21 +187,19 @@ fn collect_via_nvattest(
     let mut cmd = Command::new(&bin);
     cmd.args(&args);
     // Inherit guest env so nvattest finds driver paths; still pin binary allowlist.
-    let output = cmd
-        .output()
-        .map_err(|source| AttestationError::ToolInvoke {
-            bin: bin.clone(),
-            source,
-        })?;
+    eprintln!(
+        "[inference-engine] nvattest collect-evidence bin={bin} timeout={}s",
+        nvattest_timeout(env).as_secs()
+    );
+    let output = command_output_timed(cmd, nvattest_timeout(env), &bin)?;
     if !output.status.success() {
         return Err(AttestationError::ToolFailed { bin });
     }
-    let parsed: Value = serde_json::from_slice(&output.stdout).map_err(|source| {
-        AttestationError::Json {
+    let parsed: Value =
+        serde_json::from_slice(&output.stdout).map_err(|source| AttestationError::Json {
             path: "nvattest-stdout".into(),
             source,
-        }
-    })?;
+        })?;
     let result_code = parsed
         .get("result_code")
         .and_then(|v| v.as_i64())
@@ -189,10 +210,16 @@ fn collect_via_nvattest(
         .cloned()
         .unwrap_or_default();
     if result_code != 0 || evidences.is_empty() {
+        eprintln!(
+            "[inference-engine] nvattest collect-evidence empty-or-failed result_code={result_code} evidences={}",
+            evidences.len()
+        );
         return Err(AttestationError::ToolFailed { bin });
     }
-    // Bound runtime — callers already treat tool failure as hard error.
-    let _ = Duration::from_secs(120);
+    eprintln!(
+        "[inference-engine] nvattest collect-evidence ok result_code={result_code} evidences={}",
+        evidences.len()
+    );
     Ok(parsed)
 }
 
@@ -201,23 +228,29 @@ pub fn collect_nv_cc_gpu_evidence_b64(
     env: &HashMap<String, String>,
     nonce: Option<&str>,
 ) -> Result<String, AttestationError> {
-    if !should_use_real_gpu_collector(env) || !has_cc_capable_gpu(env) {
+    let real = should_use_real_gpu_collector(env);
+    eprintln!("[inference-engine] gpu collect begin real={real}");
+    if !real || !has_cc_capable_gpu(env)? {
         if mock_allowed(env) {
+            eprintln!("[inference-engine] gpu collect skip source=mock");
             return Ok(encode_legacy_mock_gpu_evidence());
         }
+        eprintln!("[inference-engine] gpu collect skip source=not_applicable");
         return Ok(build_gpu_not_applicable_evidence());
     }
 
-    let cc_mode = read_conf_compute_state(env);
-    if !cc_mode
+    let cc_mode = read_conf_compute_state(env)?;
+    let cc_on = cc_mode
         .get("enabled")
         .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    eprintln!("[inference-engine] gpu collect cc_enabled={cc_on}");
+    if !cc_on {
         return Err(AttestationError::GpuCcModeOff);
     }
 
     let nvattest = collect_via_nvattest(env, nonce)?;
+    eprintln!("[inference-engine] gpu collect done source=nvattest");
     let architecture = nvattest
         .get("evidences")
         .and_then(|v| v.as_array())
