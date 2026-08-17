@@ -1,7 +1,7 @@
 # Tag release: build measured Rust InferenceEngine linux-amd64 runtime bundle.
 #
-# Primary attestation: engine.binary_sha256 = SHA-256 of inference-engine-runtime-*.tar.gz
-# Tag with train semver (e.g. v0.9.3).
+# Attestation fingerprints both the runtime tarball (ieRuntimeSha256) and the ELF
+# (engine.binary_sha256 / ieBinarySha256). Tag with train semver (e.g. v0.9.3).
 
 name: Release
 
@@ -36,6 +36,23 @@ jobs:
           test -f "dist/release/inference-engine-runtime-${VERSION}.tar.gz"
           cat dist/release/SHA256SUMS
           cat dist/release/RELEASE_MANIFEST.json
+          # Chat SPA verify cannot CORS-read GitHub asset downloads; it fingerprints
+          # api.github.com release `body` + asset `digest`. Embed SHA256SUMS in notes.
+          {
+            echo "## Measured artifact"
+            echo
+            echo "- **\`inference-engine-runtime-*.tar.gz\`** — runtime tarball (\`ieRuntimeSha256\`)"
+            echo "- **\`bin/teechat-inference-engine\`** — ELF fingerprint (\`engine.binary_sha256\` / \`ieBinarySha256\`)"
+            echo "- OPE FFI / attested-mtls: \`RELEASE_MANIFEST.json\` (independent TCBs; verify on their own Releases)"
+            echo
+            echo "Install / cutover: TeeChat \`docs/ops/engine-blue-green-cutover.md\` (Rust IE train)."
+            echo
+            echo "## SHA256SUMS"
+            echo
+            echo '```'
+            cat dist/release/SHA256SUMS
+            echo '```'
+          } > dist/release/RELEASE_NOTES.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -45,13 +62,6 @@ jobs:
             dist/release/SHA256SUMS
             dist/release/RELEASE_MANIFEST.json
           generate_release_notes: true
-          body: |
-            ## Measured artifact
-
-            - **`inference-engine-runtime-*.tar.gz`** — primary (`engine.binary_sha256`)
-            - OPE FFI / attested-mtls digests are recorded independently in `RELEASE_MANIFEST.json`
-              (from `config/tcb-pins.json`); verify those TCBs on their own GitHub Releases.
-
-            Install and blue/green cutover: TeeChat `docs/ops/engine-blue-green-cutover.md` (Rust IE train).
+          body_path: dist/release/RELEASE_NOTES.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
