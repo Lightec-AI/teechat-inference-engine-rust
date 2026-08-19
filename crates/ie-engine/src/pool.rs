@@ -22,11 +22,10 @@ use crate::pull_workers::{
     warn_pull_worker_start, PullWorkerRegistry, PullWorkerStartFn, SessionReadyFn,
     SessionsChangedFn,
 };
-use crate::traits::{ConnectResult, EnginePlaneConnector, InferenceUpstream, InferResult};
+use crate::traits::{ConnectResult, EnginePlaneConnector, InferResult, InferenceUpstream};
 
 /// Remint attestation before reconnect / scale / migrate (optional).
-pub type AttestationRefreshFn =
-    Arc<dyn Fn() -> Result<AttestationBundle, String> + Send + Sync>;
+pub type AttestationRefreshFn = Arc<dyn Fn() -> Result<AttestationBundle, String> + Send + Sync>;
 
 const SESSION_WATCH_INTERVAL_MS: u64 = 5_000;
 
@@ -283,10 +282,7 @@ impl SupervisedPool {
         if state.reconnect_failure_times_ms.len() as u32 >= threshold {
             state.circuit_open_until_ms = now + circuit_ms;
             state.reconnect_failure_times_ms.clear();
-            warn!(
-                circuit_ms,
-                "pool reconnect circuit opened (failure window)"
-            );
+            warn!(circuit_ms, "pool reconnect circuit opened (failure window)");
         }
     }
 
@@ -490,9 +486,8 @@ impl SupervisedPool {
     ) -> Result<AttestedConnectRequest, EngineError> {
         let refresh = self.attestation_refresh.read().await.clone();
         if let Some(refresh) = refresh {
-            let fresh = refresh().map_err(|e| {
-                EngineError::Connect(format!("attestation_refresh failed: {e}"))
-            })?;
+            let fresh = refresh()
+                .map_err(|e| EngineError::Connect(format!("attestation_refresh failed: {e}")))?;
             request.attestation = fresh;
         }
         Ok(request)
@@ -733,13 +728,7 @@ impl SupervisedPool {
         let current = self.live_session_count().await;
         let idle_ids = self.idle_session_ids().await;
         let idle = idle_ids.len() as u32;
-        let plan = plan_pool_drain(
-            self.config.pool_target_size,
-            current,
-            fraction,
-            count,
-            idle,
-        );
+        let plan = plan_pool_drain(self.config.pool_target_size, current, fraction, count, idle);
 
         let mut drained = 0u32;
         for session_id in idle_ids.into_iter().take(plan.to_drain as usize) {
@@ -775,8 +764,12 @@ impl SupervisedPool {
     }
 
     /// Make-before-break gateway migration: dial target first, then disconnect source.
+    ///
+    /// Busy SOURCE handlers (ops-control work-pull) cannot move themselves. After idle
+    /// moves, defer those sessions onto TARGET once the work-pull is idle so a flip
+    /// does not leave a leftover dispatcher ESTAB on SOURCE (TS `aea2314`).
     pub async fn migrate_gateway_pool(
-        &self,
+        self: &Arc<Self>,
         target_url: &str,
         fraction: f64,
     ) -> Result<GatewayMigrationResult, EngineError> {
@@ -787,13 +780,7 @@ impl SupervisedPool {
 
         // Sticky primary: reconnect/scale must dial the migration target (TS sets at start).
         *self.gateway_base_url.write().await = normalized.clone();
-        self.connector
-            .set_primary_gateway_url(&normalized)
-            .await;
-
-        let template = self.connect_template.read().await.clone().ok_or_else(|| {
-            EngineError::Connect("no connect template; boot the pool first".into())
-        })?;
+        self.connector.set_primary_gateway_url(&normalized).await;
 
         let state = self.state.read().await;
         let pool_size = state.slots.len() as u32;
@@ -804,19 +791,21 @@ impl SupervisedPool {
             .count() as u32;
         drop(state);
 
-        let source_ids: Vec<(usize, String)> = {
+        let source_ids: Vec<String> = {
             let state = self.state.read().await;
             state
                 .slots
                 .iter()
-                .enumerate()
-                .filter(|(_, s)| s.session.gateway_base_url != normalized)
-                .map(|(i, s)| (i, s.session.session_id.clone()))
+                .filter(|s| s.session.gateway_base_url != normalized)
+                .map(|s| s.session.session_id.clone())
                 .collect()
         };
         let mut idle_on_source = 0u32;
-        for (_, id) in &source_ids {
-            if !self.session_is_busy(id).await {
+        let mut busy_source_ids = Vec::new();
+        for id in &source_ids {
+            if self.session_is_busy(id).await {
+                busy_source_ids.push(id.clone());
+            } else {
                 idle_on_source += 1;
             }
         }
@@ -824,92 +813,37 @@ impl SupervisedPool {
 
         let mut moved = 0u32;
         for _ in 0..plan.to_move {
-            let candidates: Vec<(usize, String)> = {
+            let candidates: Vec<String> = {
                 let state = self.state.read().await;
                 state
                     .slots
                     .iter()
-                    .enumerate()
-                    .filter(|(_, s)| s.session.gateway_base_url != normalized)
-                    .map(|(i, s)| (i, s.session.session_id.clone()))
+                    .filter(|s| s.session.gateway_base_url != normalized)
+                    .map(|s| s.session.session_id.clone())
                     .collect()
             };
             let mut found = None;
-            for (i, sid) in candidates {
+            for sid in candidates {
                 if !self.session_is_busy(&sid).await {
-                    found = Some((i, sid));
+                    found = Some(sid);
                     break;
                 }
             }
-            let Some((index, old_session_id)) = found else {
+            let Some(old_session_id) = found else {
                 break;
             };
 
-            let mut req = template.clone();
-            req.session_id = uuid::Uuid::new_v4().to_string();
-            req.gateway_challenge_nonce =
-                Some(crate::plane::generate_gateway_connect_challenge_nonce());
-            let req = self.apply_fresh_attestation(req).await?;
-            *self.connect_template.write().await = Some(req.clone());
-
-            let new_conn = match self.throttled_connect_to(&normalized, req).await {
-                Ok(r) => r,
-                Err(err) => {
-                    warn!(error = %err, target = %normalized, "migrate connect_to failed");
-                    return Err(EngineError::Connect(err.to_string()));
-                }
-            };
-            let new_session_id = new_conn.session_id.clone();
-
-            // Stop source puller before disconnect (TS migrateOneSession).
-            self.suppress_reconnect(&old_session_id).await;
-            self.workers.stop_session(&old_session_id).await;
-            if let Err(err) = self.connector.disconnect(&old_session_id).await {
-                warn!(
-                    session_id = %old_session_id,
-                    error = %err,
-                    "migrate source disconnect failed; keeping both sessions mapped carefully"
-                );
-            }
-
-            let mut state = self.state.write().await;
-            if let Some(slot) = state.slots.get_mut(index) {
-                if slot.session.session_id == old_session_id {
-                    slot.session.session_id = new_session_id.clone();
-                    slot.session.gateway_base_url = normalized.clone();
-                    slot.busy.store(false, Ordering::SeqCst);
-                    slot.suppress_reconnect.store(false, Ordering::SeqCst);
-                    slot.reconnect_pending.store(false, Ordering::SeqCst);
-                    slot.reconnect_attempt.store(0, Ordering::SeqCst);
-                    moved += 1;
-                } else {
-                    state.slots.push(SessionSlot {
-                        session: PoolSession {
-                            session_id: new_session_id.clone(),
-                            gateway_base_url: normalized.clone(),
-                        },
-                        ..SessionSlot::default()
-                    });
-                    moved += 1;
-                }
-            }
-            drop(state);
-
-            if let Err(err) = self.invoke_session_ready(&new_session_id).await {
-                warn!(
-                    session_id = %new_session_id,
-                    error = %err,
-                    "migrate session ready (epoch) failed"
-                );
-            }
-            if let Err(err) = self.workers.ensure_started(&new_session_id).await {
-                warn_pull_worker_start(&new_session_id, &err);
-            }
+            self.migrate_session_to(&old_session_id, &normalized)
+                .await?;
+            moved += 1;
         }
 
         if moved > 0 {
             self.notify_sessions_changed().await;
         }
+
+        // Fire-and-forget: awaiting here would deadlock the busy ops-control handler.
+        self.spawn_deferred_source_vacate(normalized.clone(), busy_source_ids);
 
         let state = self.state.read().await;
         let final_on_target = state
@@ -929,6 +863,151 @@ impl SupervisedPool {
         })
     }
 
+    fn spawn_deferred_source_vacate(self: &Arc<Self>, target: String, handler_ids: Vec<String>) {
+        if handler_ids.is_empty() {
+            return;
+        }
+        info!(
+            count = handler_ids.len(),
+            target = %target,
+            "defer SOURCE ops-control vacate onto TARGET"
+        );
+        let pool = Arc::clone(self);
+        tokio::spawn(async move {
+            pool.vacate_busy_source_handlers(target, handler_ids).await;
+        });
+    }
+
+    async fn vacate_busy_source_handlers(&self, target: String, handler_ids: Vec<String>) {
+        'outer: loop {
+            if self.closed.load(Ordering::SeqCst) {
+                return;
+            }
+            let mut pending_busy = false;
+            for id in &handler_ids {
+                if self.session_on_source(id, &target).await && self.session_is_busy(id).await {
+                    pending_busy = true;
+                    break;
+                }
+            }
+            if pending_busy {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            }
+            for id in &handler_ids {
+                if self.closed.load(Ordering::SeqCst) {
+                    return;
+                }
+                if !self.session_on_source(id, &target).await {
+                    continue;
+                }
+                if self.session_is_busy(id).await {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue 'outer;
+                }
+                if let Err(err) = self.migrate_session_to(id, &target).await {
+                    warn!(
+                        session_id = %id,
+                        error = %err,
+                        "deferred SOURCE vacate failed; retry"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue 'outer;
+                }
+            }
+            self.notify_sessions_changed().await;
+            return;
+        }
+    }
+
+    async fn session_on_source(&self, session_id: &str, target: &str) -> bool {
+        let state = self.state.read().await;
+        state
+            .slots
+            .iter()
+            .any(|s| s.session.session_id == session_id && s.session.gateway_base_url != target)
+    }
+
+    async fn migrate_session_to(
+        &self,
+        old_session_id: &str,
+        normalized: &str,
+    ) -> Result<(), EngineError> {
+        let index = {
+            let state = self.state.read().await;
+            state.slots.iter().position(|s| {
+                s.session.session_id == old_session_id && s.session.gateway_base_url != normalized
+            })
+        };
+        let Some(index) = index else {
+            return Ok(());
+        };
+
+        let template = self.connect_template.read().await.clone().ok_or_else(|| {
+            EngineError::Connect("no connect template; boot the pool first".into())
+        })?;
+
+        let mut req = template;
+        req.session_id = uuid::Uuid::new_v4().to_string();
+        req.gateway_challenge_nonce =
+            Some(crate::plane::generate_gateway_connect_challenge_nonce());
+        let req = self.apply_fresh_attestation(req).await?;
+        *self.connect_template.write().await = Some(req.clone());
+
+        let new_conn = match self.throttled_connect_to(normalized, req).await {
+            Ok(r) => r,
+            Err(err) => {
+                warn!(error = %err, target = %normalized, "migrate connect_to failed");
+                return Err(EngineError::Connect(err.to_string()));
+            }
+        };
+        let new_session_id = new_conn.session_id.clone();
+
+        // Stop source puller before disconnect (TS migrateOneSession).
+        self.suppress_reconnect(old_session_id).await;
+        self.workers.stop_session(old_session_id).await;
+        if let Err(err) = self.connector.disconnect(old_session_id).await {
+            warn!(
+                session_id = %old_session_id,
+                error = %err,
+                "migrate source disconnect failed; keeping both sessions mapped carefully"
+            );
+        }
+
+        let mut state = self.state.write().await;
+        if let Some(slot) = state.slots.get_mut(index) {
+            if slot.session.session_id == old_session_id {
+                slot.session.session_id = new_session_id.clone();
+                slot.session.gateway_base_url = normalized.to_string();
+                slot.busy.store(false, Ordering::SeqCst);
+                slot.suppress_reconnect.store(false, Ordering::SeqCst);
+                slot.reconnect_pending.store(false, Ordering::SeqCst);
+                slot.reconnect_attempt.store(0, Ordering::SeqCst);
+            } else {
+                state.slots.push(SessionSlot {
+                    session: PoolSession {
+                        session_id: new_session_id.clone(),
+                        gateway_base_url: normalized.to_string(),
+                    },
+                    ..SessionSlot::default()
+                });
+            }
+        }
+        drop(state);
+
+        if let Err(err) = self.invoke_session_ready(&new_session_id).await {
+            warn!(
+                session_id = %new_session_id,
+                error = %err,
+                "migrate session ready (epoch) failed"
+            );
+        }
+        if let Err(err) = self.workers.ensure_started(&new_session_id).await {
+            warn_pull_worker_start(&new_session_id, &err);
+        }
+        Ok(())
+    }
+
     pub async fn close_all(&self) -> Result<(), EngineError> {
         self.close_all_with_timeout(Duration::from_secs(15)).await
     }
@@ -936,7 +1015,10 @@ impl SupervisedPool {
     /// Stop pull workers, POST disconnect in parallel, then force-drop leftover H2
     /// transports. Bounded so systemd `TimeoutStopSec=120` is not spent waiting on
     /// a half-open QEMU user-net socket.
-    pub async fn close_all_with_timeout(&self, disconnect_timeout: Duration) -> Result<(), EngineError> {
+    pub async fn close_all_with_timeout(
+        &self,
+        disconnect_timeout: Duration,
+    ) -> Result<(), EngineError> {
         self.closed.store(true, Ordering::SeqCst);
         if let Some(handle) = self.watch_task.write().await.take() {
             handle.abort();
@@ -984,9 +1066,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn sessions_by_gateway_url_from_slots(
-    slots: &[PoolSession],
-) -> HashMap<String, u32> {
+pub fn sessions_by_gateway_url_from_slots(slots: &[PoolSession]) -> HashMap<String, u32> {
     let mut counts = HashMap::new();
     for slot in slots {
         let url = slot.gateway_base_url.trim();
@@ -1024,7 +1104,11 @@ mod tests {
             let sid = if request.session_id.is_empty() {
                 format!("sess-{}", NEXT_ID.fetch_add(1, Ordering::SeqCst))
             } else {
-                format!("{}-{}", request.session_id, NEXT_ID.fetch_add(1, Ordering::SeqCst))
+                format!(
+                    "{}-{}",
+                    request.session_id,
+                    NEXT_ID.fetch_add(1, Ordering::SeqCst)
+                )
             };
             Ok(ConnectResult {
                 session_id: sid,
@@ -1037,7 +1121,10 @@ mod tests {
             })
         }
 
-        async fn disconnect(&self, _session_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn disconnect(
+            &self,
+            _session_id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
     }
@@ -1195,7 +1282,9 @@ mod tests {
             let mut r1 = sample_request();
             r1.session_id = "boot-1".into();
             r1
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let mut r2 = sample_request();
         r2.session_id = "boot-2".into();
         pool.connect_one(r2).await.unwrap();
@@ -1274,6 +1363,55 @@ mod tests {
             connector.primary.lock().await.as_str(),
             "https://gateway-new"
         );
+        let counts = pool.sessions_by_gateway_url().await;
+        assert_eq!(counts.get("https://gateway-old").copied().unwrap_or(0), 1);
+        assert_eq!(counts.get("https://gateway-new").copied().unwrap_or(0), 0);
+    }
+
+    #[tokio::test]
+    async fn migrate_defers_busy_source_handler_onto_target() {
+        let connector = Arc::new(StickyMock::new("https://gateway-old"));
+        let pool = test_pool(
+            SupervisedPoolConfig {
+                pool_target_size: 1,
+                pool_initial_fraction: 1.0,
+                pool_initial_fraction_explicit: true,
+                pool_baseline: 1,
+                supervised: true,
+                reconnect: PoolReconnectConfig::default(),
+            },
+            "https://gateway-old",
+            connector.clone() as Arc<dyn EnginePlaneConnector>,
+        );
+        let mut req = sample_request();
+        req.session_id = "busy-handler".into();
+        pool.boot(req).await.unwrap();
+        let ids = pool.session_ids().await;
+        pool.set_session_busy(&ids[0], true).await;
+
+        let result = pool
+            .migrate_gateway_pool("https://gateway-new", 1.0)
+            .await
+            .unwrap();
+        assert_eq!(result.moved, 0);
+        assert_eq!(result.on_source, 1);
+
+        pool.set_session_busy(&ids[0], false).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let counts = pool.sessions_by_gateway_url().await;
+            if counts.get("https://gateway-new").copied().unwrap_or(0) == 1
+                && counts.get("https://gateway-old").copied().unwrap_or(0) == 0
+            {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("timed out waiting for deferred SOURCE vacate; counts={counts:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        pool.close_all().await.unwrap();
     }
 
     struct ReconnectMock {
@@ -1324,7 +1462,13 @@ mod tests {
         }
 
         async fn is_session_closed(&self, session_id: &str) -> bool {
-            !self.live.lock().await.get(session_id).copied().unwrap_or(false)
+            !self
+                .live
+                .lock()
+                .await
+                .get(session_id)
+                .copied()
+                .unwrap_or(false)
         }
 
         async fn teardown_for_reconnect(
