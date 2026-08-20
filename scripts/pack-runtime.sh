@@ -11,7 +11,7 @@ TAR_NAME="inference-engine-runtime-${VERSION}.tar.gz"
 
 mkdir -p "$OUT_DIR"
 echo ">> building release binary"
-cargo build --release -p ie-bin
+cargo build --release --locked --frozen -p ie-bin
 
 BIN="$ROOT/target/release/teechat-inference-engine"
 if [[ ! -x "$BIN" ]]; then
@@ -75,3 +75,25 @@ PY
 
 echo ">> pack-runtime: ${TAR_NAME} sha256=${IE_RUNTIME_SHA256:0:16}… elf=${IE_BINARY_SHA256:0:16}…"
 echo ">> wrote ${OUT_DIR}/SHA256SUMS + RELEASE_MANIFEST.json"
+
+# RB-22: bound SBOM of measured binary (component hash = ie-bin sha256).
+SBOM_PATH="$OUT_DIR/inference-engine-runtime-${VERSION}.sbom.json"
+python3 - "$SBOM_PATH" "$IE_BINARY_SHA256" "$VERSION" <<'PY'
+import json, sys
+path, sha, ver = sys.argv[1], sys.argv[2], sys.argv[3]
+doc = {
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "version": 1,
+  "metadata": {"component": {"type": "application", "name": "teechat-inference-engine", "version": ver}},
+  "components": [{
+    "type": "application",
+    "name": "teechat-inference-engine",
+    "version": ver,
+    "hashes": [{"alg": "SHA-256", "content": sha}],
+  }],
+}
+open(path, "w", encoding="utf8").write(json.dumps(doc, indent=2) + "\n")
+print("OK: wrote", path)
+PY
+echo "SBOM=$SBOM_PATH"
