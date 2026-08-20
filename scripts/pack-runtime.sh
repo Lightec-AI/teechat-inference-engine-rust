@@ -10,7 +10,9 @@ VERSION="${VERSION#v}"
 TAR_NAME="inference-engine-runtime-${VERSION}.tar.gz"
 
 mkdir -p "$OUT_DIR"
-echo ">> building release binary"
+echo ">> fetch deps (--locked) then build release binary (--locked --frozen)"
+# CI/cache miss: --frozen alone cannot checkout git deps (OPE). Fetch online first.
+cargo fetch --locked
 cargo build --release --locked --frozen -p ie-bin
 
 BIN="$ROOT/target/release/teechat-inference-engine"
