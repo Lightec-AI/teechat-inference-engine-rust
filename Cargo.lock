@@ -1129,7 +1129,7 @@ dependencies = [
 
 [[package]]
 name = "ie-attestation"
-version = "0.15.5"
+version = "0.15.6"
 dependencies = [
  "base64",
  "chrono",
@@ -1147,7 +1147,7 @@ dependencies = [
 
 [[package]]
 name = "ie-bin"
-version = "0.15.5"
+version = "0.15.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1172,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "ie-crypto"
-version = "0.15.5"
+version = "0.15.6"
 dependencies = [
  "ie-protocol",
  "ope-crypto",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "ie-engine"
-version = "0.15.5"
+version = "0.15.6"
 dependencies = [
  "async-trait",
  "base64",
@@ -1227,14 +1227,14 @@ dependencies = [
 
 [[package]]
 name = "ie-protocol"
-version = "0.15.5"
+version = "0.15.6"
 dependencies = [
  "ope-protocol",
 ]
 
 [[package]]
 name = "ie-runtime"
-version = "0.15.5"
+version = "0.15.6"
 dependencies = [
  "attested-mtls",
  "chrono",
@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "ie-upstream"
-version = "0.15.5"
+version = "0.15.6"
 dependencies = [
  "bytes",
  "futures",
