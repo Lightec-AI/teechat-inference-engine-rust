@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ie_attestation::{
-    verify_platform_attestation_bundle_mock, AttestationPolicy, PlatformAttestationBind,
-    PlatformAttestationPolicy,
+    verify_platform_attestation_bundle, AttestationPolicy, PlatformAttestationBind,
+    PlatformAttestationPolicy, ProductionCpuQuoteVerifier,
 };
 use ie_protocol::AttestedConnectResponse;
 
@@ -68,6 +68,9 @@ impl GatewayAttestationVerifier for NonceEchoGatewayAttestationVerifier {
 
 /// Full SEC-029 verifier: nonce echo + platform policy + bundle hash/ed25519 bind
 /// (parity with TS `verifyPlatformAttestationBundle`).
+///
+/// RB-07: uses [`ProductionCpuQuoteVerifier`] — not the mock platform path.
+/// Prod release dial must not call the mock convenience wrapper.
 pub struct PlatformPolicyGatewayAttestationVerifier {
     pub engine_policy: AttestationPolicy,
     pub platform_policy: PlatformAttestationPolicy,
@@ -96,12 +99,13 @@ impl GatewayAttestationVerifier for PlatformPolicyGatewayAttestationVerifier {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
-        let verdict = verify_platform_attestation_bundle_mock(
+        let verdict = verify_platform_attestation_bundle(
             bundle,
             &self.engine_policy,
             &self.platform_policy,
             &self.bind,
             now_ms,
+            &ProductionCpuQuoteVerifier,
         );
         if !verdict.ok {
             return Err(PlaneError::GatewayPlatformAttestationFailed {
