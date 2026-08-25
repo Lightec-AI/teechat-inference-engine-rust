@@ -5,13 +5,13 @@ use std::sync::Arc;
 use futures::StreamExt;
 use ie_crypto::{CryptoError, CryptoProvider, EnvelopeAdmitter, ResponseTranscriptSession};
 use ie_protocol::{
-    encode_ope_stream_line, OpeEnvelope, OpeStreamFrame, CONTENT_TYPE_OPE_JSON,
-    CONTENT_TYPE_OPE_JSON_STREAM,
+    encode_ope_status_line, encode_ope_stream_line, OpeEnvelope, OpeStreamFrame,
+    OpeStreamStatusPhase, CONTENT_TYPE_OPE_JSON, CONTENT_TYPE_OPE_JSON_STREAM,
 };
 use ie_upstream::{
     clamp_vllm_max_tokens, estimate_prompt_tokens_from_messages, normalize_vllm_messages,
-    resolve_vllm_base_url_for_model, EmbeddingsCompleteOptions, VllmChatClient, VllmStreamOptions,
-    VLLM_MAX_TOKENS_DEFAULT,
+    ope_finish_reason_status_detail, resolve_vllm_base_url_for_model, EmbeddingsCompleteOptions,
+    VllmChatClient, VllmStreamOptions, VLLM_MAX_TOKENS_DEFAULT,
 };
 use serde_json::{json, Value};
 use tracing::warn;
@@ -94,12 +94,7 @@ fn resolve_epoch_id(options: &OpeInferenceOptions, envelope: &OpeEnvelope) -> St
         .as_ref()
         .map(|e| e.ephemeral_epoch.clone())
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            options
-                .rotating
-                .as_ref()
-                .and_then(|r| r.current_epoch_id())
-        })
+        .or_else(|| options.rotating.as_ref().and_then(|r| r.current_epoch_id()))
         .unwrap_or_else(|| "unknown".into())
 }
 
@@ -254,7 +249,8 @@ pub async fn run_ope_inference_on_envelope(
                 return OpeInferenceResult {
                     status: 400,
                     content_type: "application/json".into(),
-                    body: json!({ "error": "ope_admit_failed", "detail": e.to_string() }).to_string(),
+                    body: json!({ "error": "ope_admit_failed", "detail": e.to_string() })
+                        .to_string(),
                     usage_header: None,
                 };
             }
@@ -670,6 +666,13 @@ async fn run_chat_inference(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    if let Some(out) = ndjson_out.as_mut() {
+        write_vllm_finish_status(
+            *out,
+            usage.finish_reason.as_deref(),
+            full_text.trim().is_empty(),
+        );
+    }
     let completion_tokens = match usage.completion_tokens {
         Some(n) => n,
         None => tokens_from_text(if full_text.is_empty() {
@@ -743,6 +746,25 @@ async fn run_chat_inference(
         })
         .to_string(),
         usage_header,
+    }
+}
+
+/// Forward vLLM `finish_reason` as an OPE status frame so the client can offer Continue.
+fn write_vllm_finish_status(
+    out: &mut dyn NdjsonStreamWriter,
+    finish_reason: Option<&str>,
+    output_empty: bool,
+) {
+    let Some(reason) = finish_reason else {
+        return;
+    };
+    let Some(detail) = ope_finish_reason_status_detail(reason, output_empty) else {
+        return;
+    };
+    if let Ok(line) =
+        encode_ope_status_line(OpeStreamStatusPhase::Streaming, Some(detail.as_str()), None)
+    {
+        out.write(&line);
     }
 }
 
@@ -852,6 +874,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn finish_status_emits_length_for_partial_reply() {
+        let mut buf = Vec::new();
+        write_vllm_finish_status(&mut buf, Some("length"), false);
+        let line = String::from_utf8(buf).unwrap();
+        assert!(line.contains("\"type\":\"status\""));
+        assert!(line.contains("\"phase\":\"streaming\""));
+        assert!(line.contains("finish_reason=length"));
+    }
+
+    #[test]
     fn embeddings_request_detects_input_without_messages() {
         assert!(is_embeddings_request(&json!({
             "model": "Qwen/Qwen3-Embedding-0.6B",
@@ -885,14 +917,9 @@ mod tests {
     #[test]
     fn ciphertext_frame_attaches_chain_with_session() {
         let kp = ope_crypto::mock_keypair_from_seed(&[7u8; 32]);
-        let (_signed, mut session) = ResponseTranscriptSession::begin(
-            &kp.secret,
-            "nonce",
-            "engine-1",
-            "epoch-a",
-            "A256GCM",
-        )
-        .unwrap();
+        let (_signed, mut session) =
+            ResponseTranscriptSession::begin(&kp.secret, "nonce", "engine-1", "epoch-a", "A256GCM")
+                .unwrap();
         let ct = ope_crypto::encode(b"cipher-0");
         let frame = ciphertext_frame_with_optional_chain(0, &ct, true, Some(&mut session));
         match frame {

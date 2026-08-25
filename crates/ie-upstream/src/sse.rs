@@ -68,6 +68,28 @@ pub fn stream_deltas_from_vllm_choice(choice: &Value) -> Vec<VllmTextDelta> {
     out
 }
 
+/// vLLM/OpenAI `choices[0].finish_reason` (`stop`, `length`, …). Ignores JSON null / empty.
+pub fn finish_reason_from_vllm_choice(choice: &Value) -> Option<String> {
+    let raw = choice.get("finish_reason").and_then(|v| v.as_str())?.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("null") {
+        return None;
+    }
+    Some(raw.to_ascii_lowercase())
+}
+
+/// OPE status `detail` so the desktop/web client can offer Continue on `length`.
+pub fn ope_finish_reason_status_detail(finish_reason: &str, output_empty: bool) -> Option<String> {
+    let reason = finish_reason.trim();
+    if reason.is_empty() || reason.eq_ignore_ascii_case("null") {
+        return None;
+    }
+    Some(if output_empty {
+        format!("empty_completion:{reason}")
+    } else {
+        format!("finish_reason={reason}")
+    })
+}
+
 /// Flatten choice text (reasoning then content). Prefer [`stream_deltas_from_vllm_choice`]
 /// when the caller needs to insert a thinking/answer boundary.
 pub fn stream_text_from_vllm_choice(choice: &Value) -> Option<String> {
@@ -141,5 +163,33 @@ mod tests {
         let deltas = stream_deltas_from_vllm_choice(&choice);
         assert_eq!(deltas[0].kind, VllmTextKind::Reasoning);
         assert_eq!(deltas[1].kind, VllmTextKind::Content);
+    }
+
+    #[test]
+    fn finish_reason_reads_length_and_ignores_null() {
+        assert_eq!(
+            finish_reason_from_vllm_choice(&json!({"finish_reason": "length"})).as_deref(),
+            Some("length")
+        );
+        assert_eq!(
+            finish_reason_from_vllm_choice(&json!({"finish_reason": "STOP"})).as_deref(),
+            Some("stop")
+        );
+        assert_eq!(
+            finish_reason_from_vllm_choice(&json!({"finish_reason": serde_json::Value::Null})),
+            None
+        );
+    }
+
+    #[test]
+    fn ope_status_detail_marks_length_for_continue() {
+        assert_eq!(
+            ope_finish_reason_status_detail("length", false).as_deref(),
+            Some("finish_reason=length")
+        );
+        assert_eq!(
+            ope_finish_reason_status_detail("length", true).as_deref(),
+            Some("empty_completion:length")
+        );
     }
 }

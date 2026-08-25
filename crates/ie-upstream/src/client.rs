@@ -7,7 +7,8 @@ use reqwest::Client;
 use serde_json::{json, Value};
 
 use crate::sse::{
-    parse_sse_data_line, stream_deltas_from_vllm_choice, VllmTextKind, STREAM_THINKING_SEPARATOR,
+    finish_reason_from_vllm_choice, parse_sse_data_line, stream_deltas_from_vllm_choice,
+    VllmTextKind, STREAM_THINKING_SEPARATOR,
 };
 use crate::UpstreamError;
 
@@ -64,7 +65,9 @@ pub fn open_ai_embeddings_url(base_url: &str) -> String {
 }
 
 /// CPU TEI / OpenAI-compatible embeddings on the engine guest loopback.
-pub fn embeddings_config_from_env(env: &HashMap<String, String>) -> Option<(String, Option<String>)> {
+pub fn embeddings_config_from_env(
+    env: &HashMap<String, String>,
+) -> Option<(String, Option<String>)> {
     let base_url = env
         .get("TEECHAT_EMBEDDINGS_UPSTREAM_URL")
         .or_else(|| env.get("VLLM_EMBED_BASE_URL"))
@@ -93,7 +96,9 @@ pub fn embed_model_id_from_env(env: &HashMap<String, String>) -> Option<String> 
 }
 
 /// Task vLLM upstream (localhost :8001 inside prod-engine guest).
-pub fn vllm_task_config_from_env(env: &HashMap<String, String>) -> Option<(String, Option<String>)> {
+pub fn vllm_task_config_from_env(
+    env: &HashMap<String, String>,
+) -> Option<(String, Option<String>)> {
     let base_url = env
         .get("VLLM_TASK_BASE_URL")
         .or_else(|| env.get("TEECHAT_TASK_VLLM_BASE_URL"))
@@ -192,6 +197,8 @@ pub struct VllmUsageState {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
+    /// Last non-null `choices[0].finish_reason` (`stop`, `length`, …).
+    pub finish_reason: Option<String>,
 }
 
 /// Parse OpenAI-compatible usage (vLLM APC → `prompt_tokens_details.cached_tokens`).
@@ -318,17 +325,20 @@ impl VllmChatClient {
         UpstreamError,
     > {
         let url = open_ai_chat_completions_url(&opts.base_url);
-        let mut req = self.http.post(url).json(&build_vllm_chat_body(&VllmChatBodyOptions {
-            model: &opts.model,
-            messages: &opts.messages,
-            stream: true,
-            max_tokens: opts.max_tokens,
-            frequency_penalty: opts.frequency_penalty,
-            presence_penalty: opts.presence_penalty,
-            temperature: opts.temperature,
-            top_p: opts.top_p,
-            enable_thinking: opts.enable_thinking,
-        }));
+        let mut req = self
+            .http
+            .post(url)
+            .json(&build_vllm_chat_body(&VllmChatBodyOptions {
+                model: &opts.model,
+                messages: &opts.messages,
+                stream: true,
+                max_tokens: opts.max_tokens,
+                frequency_penalty: opts.frequency_penalty,
+                presence_penalty: opts.presence_penalty,
+                temperature: opts.temperature,
+                top_p: opts.top_p,
+                enable_thinking: opts.enable_thinking,
+            }));
         if let Some(key) = opts.api_key.as_deref().filter(|k| !k.is_empty()) {
             req = req.bearer_auth(key);
         }
@@ -363,17 +373,20 @@ impl VllmChatClient {
 
     pub async fn complete_chat(&self, opts: VllmCompleteOptions) -> Result<String, UpstreamError> {
         let url = open_ai_chat_completions_url(&opts.base_url);
-        let mut req = self.http.post(url).json(&build_vllm_chat_body(&VllmChatBodyOptions {
-            model: &opts.model,
-            messages: &opts.messages,
-            stream: false,
-            max_tokens: opts.max_tokens,
-            frequency_penalty: opts.frequency_penalty,
-            presence_penalty: opts.presence_penalty,
-            temperature: opts.temperature,
-            top_p: opts.top_p,
-            enable_thinking: opts.enable_thinking,
-        }));
+        let mut req = self
+            .http
+            .post(url)
+            .json(&build_vllm_chat_body(&VllmChatBodyOptions {
+                model: &opts.model,
+                messages: &opts.messages,
+                stream: false,
+                max_tokens: opts.max_tokens,
+                frequency_penalty: opts.frequency_penalty,
+                presence_penalty: opts.presence_penalty,
+                temperature: opts.temperature,
+                top_p: opts.top_p,
+                enable_thinking: opts.enable_thinking,
+            }));
         if let Some(key) = opts.api_key.as_deref().filter(|k| !k.is_empty()) {
             req = req.bearer_auth(key);
         }
@@ -547,6 +560,11 @@ impl<S> VllmSseStream<S> {
             // Usage-only trailer chunks have empty `choices`.
             return Ok(());
         };
+        if let Some(reason) = finish_reason_from_vllm_choice(choice) {
+            if let Ok(mut state) = self.usage.lock() {
+                state.finish_reason = Some(reason);
+            }
+        }
         for delta in stream_deltas_from_vllm_choice(choice) {
             match delta.kind {
                 VllmTextKind::Reasoning => {
