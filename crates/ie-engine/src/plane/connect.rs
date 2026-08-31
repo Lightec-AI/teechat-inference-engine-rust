@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use ie_protocol::{
-    AttestedConnectRequest, AttestedConnectResponse, ENGINE_PLANE_PATH_CONNECT,
-};
+use ie_protocol::{AttestedConnectRequest, AttestedConnectResponse, ENGINE_PLANE_PATH_CONNECT};
 use ie_runtime::EngineClientTlsMaterial;
 
 use super::challenge::normalize_gateway_connect_challenge_nonce;
@@ -45,6 +43,7 @@ pub async fn open_pooled_connection_on_transport(
     transport: Box<dyn PlaneTransport>,
     opts: &EnginePlaneDialOptions,
     session_id: &str,
+    peer_server_cert_sha256: Option<&str>,
 ) -> Result<(AttestedH2Session, AttestedConnectResponse), PlaneError> {
     let body = build_connect_request(
         &opts.connect_template,
@@ -71,7 +70,11 @@ pub async fn open_pooled_connection_on_transport(
             .gateway_challenge_nonce
             .as_deref()
             .ok_or(PlaneError::GatewayChallengeNonceRequired)?;
-        if let Err(err) = verifier.verify_connect_response(&parsed, expected).await {
+        let cert = peer_server_cert_sha256.ok_or(PlaneError::GatewayTlsCertUnbound)?;
+        if let Err(err) = verifier
+            .verify_connect_response(&parsed, expected, cert)
+            .await
+        {
             let _ = transport.close().await;
             return Err(err);
         }
@@ -88,13 +91,19 @@ pub async fn open_pooled_connection(
     opts: &EnginePlaneDialOptions,
     session_id: &str,
 ) -> Result<(AttestedH2Session, AttestedConnectResponse), PlaneError> {
-    let transport = super::hyper_transport::dial_hyper_transport(
+    let dialed = super::hyper_transport::dial_hyper_transport(
         &opts.gateway_base_url,
         &opts.tls,
         opts.reject_unauthorized,
     )
     .await?;
-    open_pooled_connection_on_transport(transport, opts, session_id).await
+    open_pooled_connection_on_transport(
+        dialed.transport,
+        opts,
+        session_id,
+        Some(&dialed.server_cert_sha256),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -102,8 +111,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use ie_protocol::{
-        AttestationBundle, AttestationVerdict, CpuTeeAttestation, CpuTeeKind, EngineStartupIdentity,
-        GpuTeeAttestation, GpuTeeKind, WorkloadMeasurements,
+        AttestationBundle, AttestationVerdict, CpuTeeAttestation, CpuTeeKind,
+        EngineStartupIdentity, GpuTeeAttestation, GpuTeeKind, WorkloadMeasurements,
     };
     use serde_json::json;
     use std::sync::{Arc, Mutex};
@@ -205,9 +214,10 @@ mod tests {
             body: json!({ "ok": true, "pool_target_ack": 2 }),
             seen: seen.clone(),
         });
-        let (_session, resp) = open_pooled_connection_on_transport(transport, &opts, "sess-9")
-            .await
-            .unwrap();
+        let (_session, resp) =
+            open_pooled_connection_on_transport(transport, &opts, "sess-9", None)
+                .await
+                .unwrap();
         assert!(resp.ok);
         let (method, path, body) = seen.lock().unwrap().clone().unwrap();
         assert_eq!(method, "POST");
@@ -256,11 +266,13 @@ mod tests {
                 Ok(())
             }
         }
-        let err = match open_pooled_connection_on_transport(Box::new(FailTransport), &opts, "s").await
-        {
-            Ok(_) => panic!("expected connect failure"),
-            Err(e) => e,
-        };
+        let err =
+            match open_pooled_connection_on_transport(Box::new(FailTransport), &opts, "s", None)
+                .await
+            {
+                Ok(_) => panic!("expected connect failure"),
+                Err(e) => e,
+            };
         match err {
             PlaneError::ConnectHttp { status, body } => {
                 assert_eq!(status, 503);

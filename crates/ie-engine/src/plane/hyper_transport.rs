@@ -6,15 +6,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream;
+use http_body::Frame;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
-use http_body::Frame;
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use ie_runtime::EngineClientTlsMaterial;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio_rustls::TlsConnector;
@@ -88,21 +89,16 @@ impl HyperPlaneTransport {
             }
         };
         let status = response.status().as_u16();
-        let collected = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| {
-                self.mark_closed();
-                PlaneError::H2(format!("body: {e:?}"))
-            })?;
+        let collected = response.into_body().collect().await.map_err(|e| {
+            self.mark_closed();
+            PlaneError::H2(format!("body: {e:?}"))
+        })?;
         let bytes = collected.to_bytes();
         let json = if bytes.is_empty() {
             Value::Null
         } else {
-            serde_json::from_slice(&bytes).unwrap_or(Value::String(
-                String::from_utf8_lossy(&bytes).into_owned(),
-            ))
+            serde_json::from_slice(&bytes)
+                .unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into_owned()))
         };
         Ok(H2JsonResponse { status, json })
     }
@@ -153,14 +149,10 @@ impl HyperPlaneTransport {
                 headers_out.push((name.as_str().to_string(), v.to_string()));
             }
         }
-        let collected = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| {
-                self.mark_closed();
-                PlaneError::H2(format!("body: {e:?}"))
-            })?;
+        let collected = response.into_body().collect().await.map_err(|e| {
+            self.mark_closed();
+            PlaneError::H2(format!("body: {e:?}"))
+        })?;
         Ok(H2BytesResponse {
             status,
             headers: headers_out,
@@ -276,11 +268,17 @@ impl PlaneTransport for HyperPlaneTransport {
     }
 }
 
+/// Completed engine-plane TLS dial, including the server leaf the engine saw.
+pub struct DialedHyperTransport {
+    pub transport: Box<dyn PlaneTransport>,
+    pub server_cert_sha256: String,
+}
+
 pub async fn dial_hyper_transport(
     gateway_base_url: &str,
     tls: &EngineClientTlsMaterial,
     reject_unauthorized: bool,
-) -> Result<Box<dyn PlaneTransport>, PlaneError> {
+) -> Result<DialedHyperTransport, PlaneError> {
     let url = Url::parse(gateway_base_url).map_err(|e| PlaneError::InvalidUrl(e.to_string()))?;
     let host = url
         .host_str()
@@ -310,6 +308,17 @@ pub async fn dial_hyper_transport(
             "expected ALPN h2, negotiated={alpn:?}"
         )));
     }
+    let server_cert_sha256 = {
+        let certs = tls_stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .ok_or_else(|| PlaneError::Tls("missing server certificate".into()))?;
+        let der = certs
+            .first()
+            .ok_or_else(|| PlaneError::Tls("missing server certificate".into()))?;
+        hex::encode(Sha256::digest(der.as_ref()))
+    };
 
     let io = TokioIo::new(tls_stream);
     let (sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
@@ -331,11 +340,14 @@ pub async fn dial_hyper_transport(
     } else {
         format!("{host}:{port}")
     };
-    Ok(Box::new(HyperPlaneTransport {
-        sender: Mutex::new(sender),
-        authority,
-        closed,
-    }))
+    Ok(DialedHyperTransport {
+        transport: Box::new(HyperPlaneTransport {
+            sender: Mutex::new(sender),
+            authority,
+            closed,
+        }),
+        server_cert_sha256,
+    })
 }
 
 fn build_client_config(
@@ -361,7 +373,8 @@ fn build_client_config(
         .map_err(|e| PlaneError::Tls(format!("client key: {e}")))?
         .ok_or_else(|| PlaneError::Tls("client key missing".into()))?;
 
-    let builder = ClientConfig::builder().with_root_certificates(root_store);
+    let builder = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(root_store);
     let mut config = builder
         .with_client_auth_cert(certs, key)
         .map_err(|e| PlaneError::Tls(format!("client auth: {e}")))?;

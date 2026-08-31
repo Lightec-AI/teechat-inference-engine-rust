@@ -18,6 +18,10 @@ pub enum PlaneError {
     GatewayChallengeNonceNotBound,
     #[error("gateway_platform_attestation_failed: {reason}")]
     GatewayPlatformAttestationFailed { reason: String },
+    #[error("gateway_tls_cert_unbound")]
+    GatewayTlsCertUnbound,
+    #[error("gateway_tls_cert_mismatch")]
+    GatewayTlsCertMismatch,
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("io: {0}")]
