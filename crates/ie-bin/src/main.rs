@@ -560,7 +560,9 @@ async fn run_engine(
             .ok_or_else(|| "TLS material required for live H2".to_string())?;
         let verifier: Option<Arc<dyn ie_engine::GatewayAttestationVerifier>> =
             if verify_gateway_platform_enabled(env) {
-                Some(Arc::new(platform_policy_verifier_from_env(env)))
+                Some(Arc::new(platform_policy_verifier_from_env(env).map_err(
+                    |e| format!("TEECHAT_ATTESTATION_POLICY_PATH: {e}"),
+                )?))
             } else {
                 eprintln!(
                     "[inference-engine] WARNING: TEECHAT_ENGINE_VERIFY_GATEWAY_PLATFORM=0 — SEC-029 verify disabled"

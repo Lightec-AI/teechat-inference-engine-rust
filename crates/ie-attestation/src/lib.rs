@@ -10,6 +10,7 @@ mod mock_quote;
 mod nv_cc;
 mod platform;
 mod policy;
+mod policy_file;
 mod process_timeout;
 mod refresh;
 mod sev_snp;
@@ -45,6 +46,10 @@ pub use platform::{
 pub use policy::{
     default_test_attestation_policy, verify_bundle_with_verifier, verify_claims_against_policy,
     AttestationPolicy, AttestationVerifyResult,
+};
+pub use policy_file::{
+    load_attestation_policy_from_file, parse_attestation_policy_json, LoadedAttestationPolicyFile,
+    PolicyFileError,
 };
 pub use refresh::{
     create_engine_attestation_refresher, EngineAttestationRefreshContext,
