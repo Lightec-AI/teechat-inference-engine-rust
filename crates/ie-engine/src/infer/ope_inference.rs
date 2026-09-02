@@ -162,6 +162,54 @@ fn tokens_from_text(text: &str) -> u64 {
     ((text.len() as f64 / 4.0).ceil() as u64).max(1)
 }
 
+/// OpenAPI edge omits `conversation_id`; TeeChat always sets it.
+fn envelope_bound_to_openapi(envelope: &OpeEnvelope) -> bool {
+    envelope
+        .meta
+        .as_ref()
+        .and_then(|m| m.conversation_id.as_ref())
+        .is_none()
+}
+
+fn resolve_enable_thinking(
+    envelope: &OpeEnvelope,
+    payload: &Value,
+    is_task_model: bool,
+) -> bool {
+    if is_task_model {
+        return false;
+    }
+    if let Some(explicit) = payload.get("enable_thinking").and_then(|v| v.as_bool()) {
+        return explicit;
+    }
+    if envelope_bound_to_openapi(envelope) {
+        return false;
+    }
+    true
+}
+
+fn completion_text_from_openai_delta(frame: &Value) -> Option<String> {
+    if frame.get("type").and_then(|v| v.as_str()) != Some("openai_delta") {
+        return None;
+    }
+    let delta = frame
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("delta"))?;
+    let mut out = String::new();
+    for key in ["content", "reasoning", "reasoning_content"] {
+        if let Some(text) = delta.get(key).and_then(|v| v.as_str()) {
+            out.push_str(text);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 fn strip_model_provider(model: &str) -> String {
     match model.find('@') {
         Some(at) => model[..at].to_string(),
@@ -562,6 +610,9 @@ async fn run_chat_inference(
         .and_then(|v| v.as_u64())
         .map(|n| clamp_vllm_max_tokens(n as u32));
 
+    let legacy_completion_text = ie_upstream::ope_completion_legacy_text_enabled();
+    let enable_thinking = resolve_enable_thinking(envelope, payload, is_task_model);
+
     // Open vLLM *before* writing any OPE stream bytes. Previously we emitted
     // `server_share` first, then on context-length / upstream HTTP errors still
     // finished an empty `ope+json-stream` with x-ope-status 200 — OpenAPI
@@ -579,10 +630,8 @@ async fn run_chat_inference(
             temperature: payload.get("temperature").and_then(|v| v.as_f64()),
             top_p: payload.get("top_p").and_then(|v| v.as_f64()),
             // Task model must stay non-thinking (titles / search prep / digests).
-            enable_thinking: payload
-                .get("enable_thinking")
-                .and_then(|v| v.as_bool())
-                .or(Some(!is_task_model)),
+            enable_thinking: Some(enable_thinking),
+            legacy_completion_text,
         })
         .await;
 
@@ -611,16 +660,34 @@ async fn run_chat_inference(
     while let Some(item) = stream.next().await {
         match item {
             Ok(delta) => {
-                full_text.push_str(&delta);
-                pending.push_str(&delta);
-                while pending.len() >= chunk_chars {
-                    let piece: String = pending.chars().take(chunk_chars).collect();
-                    let rest: String = pending.chars().skip(chunk_chars).collect();
-                    pending = rest;
+                if legacy_completion_text {
+                    full_text.push_str(&delta);
+                    pending.push_str(&delta);
+                    while pending.len() >= chunk_chars {
+                        let piece: String = pending.chars().take(chunk_chars).collect();
+                        let rest: String = pending.chars().skip(chunk_chars).collect();
+                        pending = rest;
+                        encrypt_piece(
+                            options.provider.as_ref(),
+                            resp.session,
+                            &piece,
+                            false,
+                            &mut seq,
+                            &mut chunks,
+                            &mut ndjson_out,
+                            transcript.as_mut().map(|t| &mut t.1),
+                        );
+                    }
+                } else {
+                    if let Ok(v) = serde_json::from_str::<Value>(&delta) {
+                        if let Some(text) = completion_text_from_openai_delta(&v) {
+                            full_text.push_str(&text);
+                        }
+                    }
                     encrypt_piece(
                         options.provider.as_ref(),
                         resp.session,
-                        &piece,
+                        &delta,
                         false,
                         &mut seq,
                         &mut chunks,
@@ -872,6 +939,59 @@ pub fn ciphertext_frame_with_optional_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_enable_thinking_defaults_off_for_openapi_envelope() {
+        let envelope = ie_protocol::OpeEnvelope {
+            ope_version: "1.0".into(),
+            alg: "e2e-hybrid-pq".into(),
+            enc: "e2e-hybrid-pq".into(),
+            kid: "k".into(),
+            recipient: "r".into(),
+            ts: "t".into(),
+            nonce: "n".into(),
+            payload_hash: "h".into(),
+            engine_id: Some("e".into()),
+            meta: Some(ie_protocol::OpeEnvelopeMeta {
+                conversation_id: None,
+                model: Some("m".into()),
+                tenant: None,
+                metering: None,
+                route: None,
+                traffic_class: None,
+                gateway_task: None,
+            }),
+            sig: None,
+            ciphertext: Some("c".into()),
+            iv: Some("i".into()),
+            e2e: None,
+        };
+        assert!(!resolve_enable_thinking(&envelope, &json!({}), false));
+        let teechat = ie_protocol::OpeEnvelopeMeta {
+            conversation_id: Some("conv-1".into()),
+            model: Some("m".into()),
+            tenant: None,
+            metering: None,
+            route: None,
+            traffic_class: None,
+            gateway_task: None,
+        };
+        let mut env = envelope.clone();
+        env.meta = Some(teechat);
+        assert!(resolve_enable_thinking(&env, &json!({}), false));
+    }
+
+    #[test]
+    fn completion_text_from_openai_delta_reads_content() {
+        let frame = json!({
+            "type": "openai_delta",
+            "choices": [{"index": 0, "delta": {"content": "💡"}, "finish_reason": null}]
+        });
+        assert_eq!(
+            completion_text_from_openai_delta(&frame).as_deref(),
+            Some("💡")
+        );
+    }
 
     #[test]
     fn finish_status_emits_length_for_partial_reply() {

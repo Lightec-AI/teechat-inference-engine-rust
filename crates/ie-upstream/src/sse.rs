@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// TeeChat client fold boundary (must match `STREAM_THINKING_SEPARATOR` in TeaChat).
 pub const STREAM_THINKING_SEPARATOR: &str = "\n\n<!-- teechat:thinking-end -->\n\n";
@@ -88,6 +88,37 @@ pub fn ope_finish_reason_status_detail(finish_reason: &str, output_empty: bool) 
     } else {
         format!("finish_reason={reason}")
     })
+}
+
+/// Neutral OPE completion frame: one vLLM stream choice as encryptable JSON (ADR §Wire format).
+pub fn openai_delta_frame_from_vllm_choice(choice: &Value) -> Option<String> {
+    let delta = choice.get("delta")?;
+    let delta_empty = delta.as_object().is_none_or(|o| o.is_empty());
+    let finish_set = finish_reason_from_vllm_choice(choice).is_some();
+    if delta_empty && !finish_set {
+        return None;
+    }
+    let index = choice.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+    let frame = json!({
+        "type": "openai_delta",
+        "choices": [{
+            "index": index,
+            "delta": delta,
+            "finish_reason": choice.get("finish_reason"),
+        }]
+    });
+    serde_json::to_string(&frame).ok()
+}
+
+/// Legacy soak: flatten reasoning+content and inject TeeChat thinking separator in-engine.
+pub fn ope_completion_legacy_text_enabled() -> bool {
+    match std::env::var("TEECHAT_OPE_COMPLETION_LEGACY_TEXT") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        }
+        Err(_) => false,
+    }
 }
 
 /// Flatten choice text (reasoning then content). Prefer [`stream_deltas_from_vllm_choice`]
@@ -191,5 +222,46 @@ mod tests {
             ope_finish_reason_status_detail("length", true).as_deref(),
             Some("empty_completion:length")
         );
+    }
+
+    #[test]
+    fn openai_delta_frame_passthrough_content_and_tool_calls() {
+        let choice = json!({
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "get_weather", "arguments": "{\"loc\":" }
+                }]
+            },
+            "finish_reason": null
+        });
+        let frame = openai_delta_frame_from_vllm_choice(&choice).unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "openai_delta");
+        assert_eq!(v["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn openai_delta_frame_emits_finish_only_chunk() {
+        let choice = json!({
+            "index": 0,
+            "delta": {},
+            "finish_reason": "tool_calls"
+        });
+        let frame = openai_delta_frame_from_vllm_choice(&choice).unwrap();
+        assert!(frame.contains("\"finish_reason\":\"tool_calls\""));
+    }
+
+    #[test]
+    fn openai_delta_frame_skips_empty_delta_without_finish() {
+        assert!(openai_delta_frame_from_vllm_choice(&json!({
+            "index": 0,
+            "delta": {},
+            "finish_reason": null
+        }))
+        .is_none());
     }
 }

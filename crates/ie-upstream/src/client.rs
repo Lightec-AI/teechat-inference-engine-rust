@@ -291,6 +291,8 @@ pub struct VllmStreamOptions {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub enable_thinking: Option<bool>,
+    /// When true, flatten vLLM deltas to TeeChat legacy text (with thinking separator).
+    pub legacy_completion_text: bool,
 }
 
 pub type VllmCompleteOptions = VllmStreamOptions;
@@ -365,6 +367,7 @@ impl VllmChatClient {
                 pending: std::collections::VecDeque::new(),
                 saw_reasoning: false,
                 reasoning_boundary_emitted: false,
+                legacy_completion_text: opts.legacy_completion_text,
                 usage: Arc::clone(&usage),
             },
             usage,
@@ -472,11 +475,12 @@ impl VllmChatClient {
 struct VllmSseStream<S> {
     byte_stream: S,
     buffer: String,
-    /// Pieces ready to yield (reasoning/content + optional thinking separator).
+    /// Pieces ready to yield (legacy text or neutral openai_delta JSON).
     pending: std::collections::VecDeque<String>,
     /// True after any reasoning delta; next content gets a TeeChat thinking separator.
     saw_reasoning: bool,
     reasoning_boundary_emitted: bool,
+    legacy_completion_text: bool,
     usage: Arc<Mutex<VllmUsageState>>,
 }
 
@@ -517,7 +521,10 @@ where
                         self.enqueue_sse_line(line.trim())?;
                     }
                     // Thinking-only streams still need the fold boundary for the client UI.
-                    if self.saw_reasoning && !self.reasoning_boundary_emitted {
+                    if self.legacy_completion_text
+                        && self.saw_reasoning
+                        && !self.reasoning_boundary_emitted
+                    {
                         self.reasoning_boundary_emitted = true;
                         self.pending
                             .push_back(STREAM_THINKING_SEPARATOR.to_string());
@@ -565,21 +572,25 @@ impl<S> VllmSseStream<S> {
                 state.finish_reason = Some(reason);
             }
         }
-        for delta in stream_deltas_from_vllm_choice(choice) {
-            match delta.kind {
-                VllmTextKind::Reasoning => {
-                    self.saw_reasoning = true;
-                    self.pending.push_back(delta.text);
-                }
-                VllmTextKind::Content => {
-                    if self.saw_reasoning && !self.reasoning_boundary_emitted {
-                        self.reasoning_boundary_emitted = true;
-                        self.pending
-                            .push_back(STREAM_THINKING_SEPARATOR.to_string());
+        if self.legacy_completion_text {
+            for delta in stream_deltas_from_vllm_choice(choice) {
+                match delta.kind {
+                    VllmTextKind::Reasoning => {
+                        self.saw_reasoning = true;
+                        self.pending.push_back(delta.text);
                     }
-                    self.pending.push_back(delta.text);
+                    VllmTextKind::Content => {
+                        if self.saw_reasoning && !self.reasoning_boundary_emitted {
+                            self.reasoning_boundary_emitted = true;
+                            self.pending
+                                .push_back(STREAM_THINKING_SEPARATOR.to_string());
+                        }
+                        self.pending.push_back(delta.text);
+                    }
                 }
             }
+        } else if let Some(frame) = crate::sse::openai_delta_frame_from_vllm_choice(choice) {
+            self.pending.push_back(frame);
         }
         Ok(())
     }

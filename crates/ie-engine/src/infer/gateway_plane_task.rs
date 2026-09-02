@@ -15,9 +15,7 @@ pub fn is_gateway_plane_task_envelope(envelope: &OpeEnvelope) -> bool {
     envelope.enc == GATEWAY_PLANE_TASK_ENC
 }
 
-fn validate_gateway_plane_task_envelope(
-    envelope: &OpeEnvelope,
-) -> Result<(), (u16, &'static str)> {
+fn validate_gateway_plane_task_envelope(envelope: &OpeEnvelope) -> Result<(), (u16, &'static str)> {
     if !is_gateway_plane_task_envelope(envelope) {
         return Err((400, "not_gateway_plane_task"));
     }
@@ -133,6 +131,7 @@ pub async fn run_gateway_plane_task_inference(
             temperature: task.temperature.map(|t| t as f64),
             top_p: None,
             enable_thinking: Some(false),
+            legacy_completion_text: false,
         })
         .await
     {
