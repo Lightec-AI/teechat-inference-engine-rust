@@ -261,6 +261,14 @@ pub fn build_vllm_chat_body(opts: &VllmChatBodyOptions<'_>) -> Value {
     if let Some(v) = opts.top_p {
         body["top_p"] = json!(v);
     }
+    // OpenAPI / Cline / WorkBuddy: pass through OpenAI tools so vLLM
+    // `--enable-auto-tool-choice` can emit structured `tool_calls`.
+    if let Some(tools) = opts.tools {
+        body["tools"] = tools.clone();
+    }
+    if let Some(tool_choice) = opts.tool_choice {
+        body["tool_choice"] = tool_choice.clone();
+    }
     if let Some(enable) = opts.enable_thinking {
         body = merge_vllm_thinking_into_body(body, enable);
     }
@@ -277,6 +285,10 @@ pub struct VllmChatBodyOptions<'a> {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub enable_thinking: Option<bool>,
+    /// OpenAI `tools` array from the client request (passthrough).
+    pub tools: Option<&'a Value>,
+    /// OpenAI `tool_choice` (`auto` | `required` | `{type:function,…}`).
+    pub tool_choice: Option<&'a Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +305,8 @@ pub struct VllmStreamOptions {
     pub enable_thinking: Option<bool>,
     /// When true, flatten vLLM deltas to TeeChat legacy text (with thinking separator).
     pub legacy_completion_text: bool,
+    pub tools: Option<Value>,
+    pub tool_choice: Option<Value>,
 }
 
 pub type VllmCompleteOptions = VllmStreamOptions;
@@ -340,6 +354,8 @@ impl VllmChatClient {
                 temperature: opts.temperature,
                 top_p: opts.top_p,
                 enable_thinking: opts.enable_thinking,
+                tools: opts.tools.as_ref(),
+                tool_choice: opts.tool_choice.as_ref(),
             }));
         if let Some(key) = opts.api_key.as_deref().filter(|k| !k.is_empty()) {
             req = req.bearer_auth(key);
@@ -389,6 +405,8 @@ impl VllmChatClient {
                 temperature: opts.temperature,
                 top_p: opts.top_p,
                 enable_thinking: opts.enable_thinking,
+                tools: opts.tools.as_ref(),
+                tool_choice: opts.tool_choice.as_ref(),
             }));
         if let Some(key) = opts.api_key.as_deref().filter(|k| !k.is_empty()) {
             req = req.bearer_auth(key);
@@ -628,8 +646,39 @@ mod tests {
             temperature: None,
             top_p: None,
             enable_thinking: None,
+            tools: None,
+            tool_choice: None,
         });
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn stream_body_passes_tools_and_tool_choice() {
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "get_time",
+                "description": "UTC time",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }]);
+        let tool_choice = json!("auto");
+        let body = build_vllm_chat_body(&VllmChatBodyOptions {
+            model: "Qwen/Qwen3.6-35B-A3B",
+            messages: &[json!({"role":"user","content":"time?"})],
+            stream: false,
+            max_tokens: Some(128),
+            frequency_penalty: None,
+            presence_penalty: None,
+            temperature: Some(0.0),
+            top_p: None,
+            enable_thinking: Some(false),
+            tools: Some(&tools),
+            tool_choice: Some(&tool_choice),
+        });
+        assert_eq!(body["tools"], tools);
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
     }
 
     #[test]

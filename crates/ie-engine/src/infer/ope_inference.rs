@@ -610,7 +610,14 @@ async fn run_chat_inference(
         .and_then(|v| v.as_u64())
         .map(|n| clamp_vllm_max_tokens(n as u32));
 
-    let legacy_completion_text = ie_upstream::ope_completion_legacy_text_enabled();
+    let tools = payload.get("tools").filter(|v| !v.is_null());
+    let tool_choice = payload.get("tool_choice").filter(|v| !v.is_null());
+    // OpenAPI / agent clients need structured tool_calls. Legacy text flattening
+    // drops `delta.tool_calls`; force neutral openai_delta frames when tools are
+    // present or the envelope is OpenAPI-bound (no conversation_id).
+    let legacy_completion_text = ie_upstream::ope_completion_legacy_text_enabled()
+        && tools.is_none()
+        && !envelope_bound_to_openapi(envelope);
     let enable_thinking = resolve_enable_thinking(envelope, payload, is_task_model);
 
     // Open vLLM *before* writing any OPE stream bytes. Previously we emitted
@@ -632,6 +639,8 @@ async fn run_chat_inference(
             // Task model must stay non-thinking (titles / search prep / digests).
             enable_thinking: Some(enable_thinking),
             legacy_completion_text,
+            tools: tools.cloned(),
+            tool_choice: tool_choice.cloned(),
         })
         .await;
 

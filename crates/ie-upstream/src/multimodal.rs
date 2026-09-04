@@ -25,6 +25,8 @@ fn content_to_plain_text(content: &Value) -> String {
 ///
 /// Hoists every `system` turn to the front (merged) — Gemma chat templates
 /// reject system messages that appear after the first non-system turn.
+/// Preserves OpenAI tool-call fields (`tool_calls`, `tool_call_id`, `name`)
+/// needed for multi-turn agent loops (Cline / WorkBuddy / OpenAPI).
 pub fn normalize_vllm_messages(messages: &[Value]) -> Vec<Value> {
     let mapped: Vec<Value> = messages
         .iter()
@@ -35,7 +37,7 @@ pub fn normalize_vllm_messages(messages: &[Value]) -> Vec<Value> {
                 .unwrap_or("user")
                 .to_string();
             let content = m.get("content");
-            match content {
+            let mut out = match content {
                 Some(Value::String(s)) => json!({ "role": role, "content": s }),
                 Some(Value::Array(parts)) => {
                     let mut out_parts = Vec::new();
@@ -74,9 +76,21 @@ pub fn normalize_vllm_messages(messages: &[Value]) -> Vec<Value> {
                         json!({ "role": role, "content": out_parts })
                     }
                 }
+                Some(Value::Null) => json!({ "role": role, "content": Value::Null }),
                 Some(other) => json!({ "role": role, "content": other.to_string() }),
-                None => json!({ "role": role, "content": "" }),
+                None => json!({ "role": role, "content": Value::Null }),
+            };
+            // Preserve tool-loop fields OpenAI clients send on follow-up turns.
+            if let Some(obj) = out.as_object_mut() {
+                for key in ["tool_calls", "tool_call_id", "name"] {
+                    if let Some(v) = m.get(key) {
+                        if !v.is_null() {
+                            obj.insert(key.to_string(), v.clone());
+                        }
+                    }
+                }
             }
+            out
         })
         .collect();
 
@@ -193,5 +207,33 @@ mod tests {
         })]);
         // ceil(4/4)=1 + 512 = 513
         assert_eq!(estimate_prompt_tokens_from_messages(&msgs), 513);
+    }
+
+    #[test]
+    fn normalize_preserves_tool_call_fields() {
+        let msgs = vec![
+            json!({"role":"user","content":"time?"}),
+            json!({
+                "role":"assistant",
+                "content": null,
+                "tool_calls":[{
+                    "id":"c1",
+                    "type":"function",
+                    "function":{"name":"get_time","arguments":"{}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"c1",
+                "name":"get_time",
+                "content":"12:00Z"
+            }),
+        ];
+        let out = normalize_vllm_messages(&msgs);
+        assert!(out[1]["content"].is_null());
+        assert_eq!(out[1]["tool_calls"][0]["id"], "c1");
+        assert_eq!(out[2]["tool_call_id"], "c1");
+        assert_eq!(out[2]["name"], "get_time");
+        assert_eq!(out[2]["content"], "12:00Z");
     }
 }

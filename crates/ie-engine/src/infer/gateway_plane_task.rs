@@ -132,6 +132,8 @@ pub async fn run_gateway_plane_task_inference(
             top_p: None,
             enable_thinking: Some(false),
             legacy_completion_text: false,
+            tools: None,
+            tool_choice: None,
         })
         .await
     {

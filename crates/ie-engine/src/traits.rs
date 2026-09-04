@@ -120,6 +120,8 @@ impl InferenceUpstream for VllmChatClient {
                 top_p: None,
                 enable_thinking: None,
                 legacy_completion_text: false,
+                tools: None,
+                tool_choice: None,
             })
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
