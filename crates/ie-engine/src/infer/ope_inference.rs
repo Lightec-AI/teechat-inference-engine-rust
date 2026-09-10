@@ -706,11 +706,38 @@ async fn run_chat_inference(
                 }
             }
             Err(e) => {
-                options.provider.free_response(resp.session);
                 warn!(error = %e, "vllm stream error");
-                // If we already wrote ciphertext, pull finishes the open stream (partial
-                // tokens). JSON error is only useful when nothing was flushed yet.
+                // If we already wrote ciphertext, close RB-06 with a final frame so
+                // clients can keep partial tokens instead of `transcript truncated`.
                 if streaming && seq > 0 {
+                    if !pending.is_empty() {
+                        encrypt_piece(
+                            options.provider.as_ref(),
+                            resp.session,
+                            &pending,
+                            true,
+                            &mut seq,
+                            &mut chunks,
+                            &mut ndjson_out,
+                            transcript.as_mut().map(|t| &mut t.1),
+                        );
+                        pending.clear();
+                    } else {
+                        encrypt_piece(
+                            options.provider.as_ref(),
+                            resp.session,
+                            "",
+                            true,
+                            &mut seq,
+                            &mut chunks,
+                            &mut ndjson_out,
+                            transcript.as_mut().map(|t| &mut t.1),
+                        );
+                    }
+                    if let Some(out) = ndjson_out.as_mut() {
+                        out.end();
+                    }
+                    options.provider.free_response(resp.session);
                     return OpeInferenceResult {
                         status: 502,
                         content_type: CONTENT_TYPE_OPE_JSON_STREAM.into(),
@@ -718,6 +745,7 @@ async fn run_chat_inference(
                         usage_header: None,
                     };
                 }
+                options.provider.free_response(resp.session);
                 return vllm_upstream_failed_result(&e);
             }
         }
@@ -728,6 +756,19 @@ async fn run_chat_inference(
             options.provider.as_ref(),
             resp.session,
             &pending,
+            true,
+            &mut seq,
+            &mut chunks,
+            &mut ndjson_out,
+            transcript.as_mut().map(|t| &mut t.1),
+        );
+    } else if seq > 0 {
+        // openai_delta / tools path (and legacy when the last chunk filled exactly):
+        // every prior frame was non-final — emit an empty final so RB-06 can finish.
+        encrypt_piece(
+            options.provider.as_ref(),
+            resp.session,
+            "",
             true,
             &mut seq,
             &mut chunks,
@@ -1058,5 +1099,63 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn empty_final_frame_closes_transcript_after_non_final() {
+        let kp = ope_crypto::mock_keypair_from_seed(&[11u8; 32]);
+        let (signed, mut session) =
+            ResponseTranscriptSession::begin(&kp.secret, "nonce", "engine-1", "epoch-a", "A256GCM")
+                .unwrap();
+        let expectations = ope_envelope::TranscriptExpectations {
+            request_nonce: Some("nonce".into()),
+            engine_id: Some("engine-1".into()),
+            epoch_id: Some("epoch-a".into()),
+        };
+        let mut reader =
+            ope_envelope::TranscriptReader::begin(&signed, &kp.public, &expectations).unwrap();
+        let ct0 = ope_crypto::encode(b"delta-0");
+        let f0 = ciphertext_frame_with_optional_chain(0, &ct0, false, Some(&mut session));
+        match &f0 {
+            OpeStreamFrame::Ciphertext {
+                chain: Some(chain),
+                ciphertext,
+                final_,
+                ..
+            } => {
+                assert!(!*final_);
+                reader
+                    .accept(&ope_envelope::TranscriptFrame {
+                        seq: 0,
+                        ciphertext: ciphertext.clone(),
+                        final_: *final_,
+                        chain: chain.clone(),
+                    })
+                    .unwrap();
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let ct_final = ope_crypto::encode(b"");
+        let f_final = ciphertext_frame_with_optional_chain(1, &ct_final, true, Some(&mut session));
+        match &f_final {
+            OpeStreamFrame::Ciphertext {
+                chain: Some(chain),
+                ciphertext,
+                final_,
+                ..
+            } => {
+                assert!(*final_);
+                reader
+                    .accept(&ope_envelope::TranscriptFrame {
+                        seq: 1,
+                        ciphertext: ciphertext.clone(),
+                        final_: true,
+                        chain: chain.clone(),
+                    })
+                    .unwrap();
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        reader.finish().unwrap();
     }
 }
