@@ -67,4 +67,6 @@ Capable of supervised pool boot, work-pull OPE inference, epoch rotation, attest
 
 ## License
 
-Apache-2.0
+GNU AGPL-3.0-or-later. See [LICENSE](LICENSE).
+
+Versions through **0.16.2** remain Apache-2.0. **0.17.0** and later are AGPL-3.0-or-later. Commercial licensing is available from Lightec AI for use that cannot accept the AGPL.
