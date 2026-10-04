@@ -7,22 +7,23 @@ use async_trait::async_trait;
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 use ie_attestation::{
-    build_engine_attestation_bundle, build_engine_epoch_attestation_bundle,
-    create_engine_attestation_refresher, load_tcb_pins, validate_tcb_pins,
-    EngineAttestationRefreshContext, QuoteEpochClaims,
+    build_engine_attestation_bundle, build_engine_attestation_bundle_with_gpu,
+    build_engine_epoch_attestation_bundle, load_tcb_pins, validate_tcb_pins, GpuEvidenceSource,
+    QuoteEpochClaims,
 };
 use ie_crypto::{MockCryptoProvider, RealCryptoProvider};
 use ie_engine::{
     apply_engine_ops_control, configure_event_log_from_env, create_pool_connect_throttle_from_env,
     engine_instance_id_from_env, epoch_rotation_policy_from_env,
     generate_gateway_connect_challenge_nonce, install_engine_controls,
-    mint_engine_challenge_response, platform_policy_verifier_from_env, spawn_desired_pool_applier,
+    mint_engine_challenge_response, new_gpu_evidence_cache, platform_policy_verifier_from_env,
+    read_gpu_evidence_cache, spawn_desired_pool_applier, spawn_gpu_evidence_idle_recollect,
     start_pull_worker, warn_pull_worker_start, DesiredPoolTargetCallback, EngineChallengeEpoch,
     EngineChallengeHandler, EngineChallengeMeasurement, EngineOpsControlHandler,
     EnginePlaneDialOptions, EphemeralPoster, EpochEvidenceMinter, EpochRotatedCallback,
-    EpochRotator, EpochRotatorOptions, EpochRotatorSession, Http2EnginePlaneConnector,
-    MintEngineChallengeArgs, OpeInferenceOptions, OpsControlRateLimiter, PullWorkerStartFn,
-    RotatingEpochDecryptor, SupervisedPool, SupervisedPoolConfig,
+    EpochRotator, EpochRotatorOptions, EpochRotatorSession, GpuIdleRecollectConfig,
+    Http2EnginePlaneConnector, MintEngineChallengeArgs, OpeInferenceOptions, OpsControlRateLimiter,
+    PullWorkerStartFn, RotatingEpochDecryptor, SupervisedPool, SupervisedPoolConfig,
 };
 use ie_protocol::{
     AttestedConnectRequest, EngineEphemeralRegisterRequest, CAPABILITY_OPS_CONTROL_V1,
@@ -596,6 +597,7 @@ async fn run_engine(
     let live_sessions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let mut rotator_handle: Option<Arc<EpochRotator>> = None;
     let mut prune_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut gpu_recollect_task: Option<tokio::task::JoinHandle<()>> = None;
 
     if let Some(h2) = h2 {
         pool.set_on_sessions_changed(Some(Arc::new({
@@ -630,15 +632,23 @@ async fn run_engine(
             }
         });
 
-        // Every epoch gets its own hardware report over its own keys. When the
-        // platform cannot produce one, the rotator falls back to the connect
+        // Boot collected live GPU evidence once. Rotation remints SNP only and
+        // reuses these bytes — live nvattest on a serving GPU wedged prod
+        // 2026-10-02 after a successful collect. Idle recollect may refresh the
+        // cache later (no client nonce; see spawn_gpu_evidence_idle_recollect).
+        let gpu_evidence_cache = new_gpu_evidence_cache(attestation.gpu_tee.evidence.clone());
+
+        // Every epoch gets its own hardware SNP report over its own keys. When
+        // the platform cannot produce one, the rotator falls back to the connect
         // bundle so a mock/dev boot still comes up (RB-45).
         let mint_epoch_evidence: EpochEvidenceMinter = {
             let ed25519_public = ed25519_public_b64.clone();
             let tls_cert_sha = tls_cert_sha.clone();
             let root = PathBuf::from(cwd);
             let env = env.clone();
+            let gpu_cache = Arc::clone(&gpu_evidence_cache);
             Arc::new(move |claims: &QuoteEpochClaims| {
+                let gpu = read_gpu_evidence_cache(&gpu_cache);
                 match build_engine_epoch_attestation_bundle(
                     &env,
                     &root,
@@ -646,6 +656,7 @@ async fn run_engine(
                     &tls_cert_sha,
                     claims,
                     None,
+                    GpuEvidenceSource::Reuse(gpu),
                 ) {
                     Ok(bundle) => Some(bundle),
                     Err(err) => {
@@ -678,16 +689,24 @@ async fn run_engine(
         ));
         *decryptor_cell.lock().expect("decryptor cell") = Some(Arc::clone(&decryptor));
 
-        // Remint attestation on later scale/migrate (parity with TS applyFreshAttestation).
-        let refresh_inner = create_engine_attestation_refresher(EngineAttestationRefreshContext {
-            ed25519_public: ed25519_public_b64.clone(),
-            tls_client_cert_sha256: tls_cert_sha.clone(),
-            root: PathBuf::from(cwd),
-            env: env.clone(),
-        });
+        // Scale/migrate: remint SNP, reuse last-good GPU (same wedge avoidance).
+        let refresh_env = env.clone();
+        let refresh_root = PathBuf::from(cwd);
+        let refresh_ed25519 = ed25519_public_b64.clone();
+        let refresh_tls = tls_cert_sha.clone();
+        let refresh_gpu = Arc::clone(&gpu_evidence_cache);
         let rotator_for_refresh = Arc::clone(&rotator);
         pool.set_attestation_refresh(Some(Arc::new(move || {
-            let bundle = refresh_inner().map_err(|e| e.to_string())?;
+            let gpu = read_gpu_evidence_cache(&refresh_gpu);
+            let bundle = build_engine_attestation_bundle_with_gpu(
+                &refresh_env,
+                &refresh_root,
+                &refresh_ed25519,
+                &refresh_tls,
+                None,
+                GpuEvidenceSource::Reuse(gpu),
+            )
+            .map_err(|e| e.to_string())?;
             rotator_for_refresh.set_attestation(bundle.clone());
             Ok(bundle)
         })))
@@ -793,6 +812,15 @@ async fn run_engine(
         pool.start_session_watch().await;
         rotator_handle = Some(Arc::clone(&rotator));
 
+        gpu_recollect_task = spawn_gpu_evidence_idle_recollect(
+            Arc::clone(&pool),
+            Arc::clone(&rotator),
+            Arc::clone(&gpu_evidence_cache),
+            env.clone(),
+            GpuIdleRecollectConfig::from_env(env),
+            Arc::new(tokio::sync::Mutex::new(())),
+        );
+
         // Drop retired epochs past overlap grace (TS `pruneTimer`, 60s).
         {
             let prune_decryptor = Arc::clone(&decryptor);
@@ -827,6 +855,9 @@ async fn run_engine(
 
     shutdown::wait_shutdown_signal().await;
     if let Some(task) = prune_task {
+        task.abort();
+    }
+    if let Some(task) = gpu_recollect_task {
         task.abort();
     }
     if let Some(r) = rotator_handle {

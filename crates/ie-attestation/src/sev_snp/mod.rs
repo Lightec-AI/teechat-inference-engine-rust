@@ -6,7 +6,8 @@ mod quote;
 mod verify_report;
 
 pub use build_attestation::{
-    build_engine_attestation_bundle, build_engine_epoch_attestation_bundle,
+    build_engine_attestation_bundle, build_engine_attestation_bundle_with_gpu,
+    build_engine_epoch_attestation_bundle, GpuEvidenceSource,
 };
 pub use endorsement::load_cpu_tee_endorsement_from_env;
 pub use guest_report::{

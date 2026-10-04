@@ -480,6 +480,20 @@ impl SupervisedPool {
         idle
     }
 
+    /// True when no pull worker (or slot fallback) is currently handling work.
+    ///
+    /// Used to gate idle-time `nvattest` recollect so collection does not run
+    /// against an actively serving inference GPU context.
+    pub async fn inference_idle(&self) -> bool {
+        let ids = self.session_ids().await;
+        for id in ids {
+            if self.session_is_busy(&id).await {
+                return false;
+            }
+        }
+        true
+    }
+
     async fn apply_fresh_attestation(
         &self,
         mut request: AttestedConnectRequest,

@@ -47,8 +47,10 @@ pub use engine_challenge::{
 pub use epoch::{
     compute_epoch_rotate_at_ms, create_engine_epoch, dispose_engine_epoch,
     epoch_rotation_lead_ms_from_env, epoch_rotation_policy_from_env, epoch_ttl_ms_from_policy,
-    CreateEngineEpochArgs, EngineEpoch, EphemeralPoster, EpochEvidenceMinter, EpochRotatedCallback,
-    EpochRotationPolicy, EpochRotator, EpochRotatorOptions, EpochRotatorSession,
+    new_gpu_evidence_cache, read_gpu_evidence_cache, spawn_gpu_evidence_idle_recollect,
+    write_gpu_evidence_cache, CreateEngineEpochArgs, EngineEpoch, EphemeralPoster,
+    EpochEvidenceMinter, EpochRotatedCallback, EpochRotationPolicy, EpochRotator,
+    EpochRotatorOptions, EpochRotatorSession, GpuEvidenceCache, GpuIdleRecollectConfig,
     RotatingEpochDecryptor,
 };
 pub use error::EngineError;

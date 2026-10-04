@@ -36,6 +36,52 @@ fn with_cpu_endorsement(
     bundle
 }
 
+/// Where GPU CC evidence comes from when minting a CPU/GPU attestation bundle.
+///
+/// Live `nvattest` must not run against a GPU that is already serving vLLM
+/// (2026-10-02 prod freeze after a successful collect). Epoch rotation and
+/// SNP-only remints therefore reuse last-good evidence; boot and idle
+/// recollect use [`GpuEvidenceSource::CollectLive`].
+#[derive(Debug, Clone)]
+pub enum GpuEvidenceSource {
+    /// Run `nvidia-smi` + `nvattest collect-evidence`.
+    ///
+    /// `nonce` is an optional **collector** binding (historically the first 32
+    /// bytes of SNP `REPORT_DATA` as hex). It is **not** a client challenge
+    /// nonce — clients bind freshness via nonce-bound SNP challenges that hash
+    /// cached GPU evidence.
+    CollectLive { nonce: Option<String> },
+    /// Reuse previously collected `gpu_tee.evidence` bytes (epoch rotation).
+    Reuse(String),
+}
+
+fn resolve_gpu_evidence(
+    env: &HashMap<String, String>,
+    source: &GpuEvidenceSource,
+    report_data_gpu_nonce: Option<&str>,
+) -> Result<String, AttestationError> {
+    match source {
+        GpuEvidenceSource::Reuse(evidence) => {
+            eprintln!(
+                "[inference-engine] gpu evidence source=reuse bytes={}",
+                evidence.len()
+            );
+            Ok(evidence.clone())
+        }
+        GpuEvidenceSource::CollectLive { nonce } => {
+            if env_flag_true(env, "TEECHAT_ENGINE_STUB") {
+                return Ok(build_gpu_not_applicable_evidence());
+            }
+            let n = nonce
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or(report_data_gpu_nonce);
+            collect_nv_cc_gpu_evidence_b64(env, n)
+        }
+    }
+}
+
 /// Mint the connect-time attestation bundle for live (or mock/stub) boots.
 pub fn build_engine_attestation_bundle(
     env: &HashMap<String, String>,
@@ -51,14 +97,15 @@ pub fn build_engine_attestation_bundle(
         tls_client_cert_sha256,
         nonce,
         None,
+        GpuEvidenceSource::CollectLive { nonce: None },
     )
 }
 
 /// Mint evidence over an epoch's own key material (bind v2).
 ///
-/// Each rotation gets its own hardware report. Reusing the boot bundle would
-/// leave the epoch keys vouched for only by the boot identity's signature,
-/// which is the gap this closes (RB-45).
+/// Each rotation gets its own hardware **SNP** report. GPU evidence should be
+/// [`GpuEvidenceSource::Reuse`] of boot/last-good bytes so live `nvattest` does
+/// not run on the serving GPU (RB-45 still holds via the fresh SNP bind-v2).
 pub fn build_engine_epoch_attestation_bundle(
     env: &HashMap<String, String>,
     root: &Path,
@@ -66,6 +113,7 @@ pub fn build_engine_epoch_attestation_bundle(
     tls_client_cert_sha256: &str,
     epoch: &QuoteEpochClaims,
     nonce: Option<&str>,
+    gpu: GpuEvidenceSource,
 ) -> Result<AttestationBundle, AttestationError> {
     build_bundle(
         env,
@@ -74,6 +122,30 @@ pub fn build_engine_epoch_attestation_bundle(
         tls_client_cert_sha256,
         nonce,
         Some(epoch),
+        gpu,
+    )
+}
+
+/// Remint a connect-shaped bundle (no epoch block) with an explicit GPU source.
+///
+/// Used for scale/migrate refresh: fresh SNP, reused GPU — same wedge avoidance
+/// as epoch rotation.
+pub fn build_engine_attestation_bundle_with_gpu(
+    env: &HashMap<String, String>,
+    root: &Path,
+    ed25519_public: &str,
+    tls_client_cert_sha256: &str,
+    nonce: Option<&str>,
+    gpu: GpuEvidenceSource,
+) -> Result<AttestationBundle, AttestationError> {
+    build_bundle(
+        env,
+        root,
+        ed25519_public,
+        tls_client_cert_sha256,
+        nonce,
+        None,
+        gpu,
     )
 }
 
@@ -84,6 +156,7 @@ fn build_bundle(
     tls_client_cert_sha256: &str,
     nonce: Option<&str>,
     epoch: Option<&QuoteEpochClaims>,
+    gpu: GpuEvidenceSource,
 ) -> Result<AttestationBundle, AttestationError> {
     let measurements = resolve_binary_measurements_from_env(env, root)?;
     let issued_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -108,11 +181,7 @@ fn build_bundle(
 
     if !should_use_sev_snp_attestation(env) {
         let cpu_quote = build_mock_cpu_quote(&claims);
-        let gpu_evidence = if env_flag_true(env, "TEECHAT_ENGINE_STUB") {
-            build_gpu_not_applicable_evidence()
-        } else {
-            collect_nv_cc_gpu_evidence_b64(env, None)?
-        };
+        let gpu_evidence = resolve_gpu_evidence(env, &gpu, None)?;
         return Ok(with_cpu_endorsement(
             claims.into_attestation_bundle(cpu_quote, gpu_evidence, &policy_id),
             env,
@@ -121,7 +190,7 @@ fn build_bundle(
 
     if env_flag_true(env, "TEECHAT_ENGINE_ALLOW_MOCK_ATTEST_ON_SNP") {
         let cpu_quote = build_mock_cpu_quote(&claims);
-        let gpu_evidence = collect_nv_cc_gpu_evidence_b64(env, None)?;
+        let gpu_evidence = resolve_gpu_evidence(env, &gpu, None)?;
         return Ok(with_cpu_endorsement(
             claims.into_attestation_bundle(cpu_quote, gpu_evidence, &policy_id),
             env,
@@ -151,7 +220,7 @@ fn build_bundle(
         claims.launch_digest = Some(ld);
     }
     let gpu_nonce = hex::encode(&report_data[..32]);
-    let gpu_evidence = collect_nv_cc_gpu_evidence_b64(env, Some(&gpu_nonce))?;
+    let gpu_evidence = resolve_gpu_evidence(env, &gpu, Some(&gpu_nonce))?;
 
     let wrapper = SevSnpQuoteWrapper {
         v: 2,
@@ -231,6 +300,7 @@ mod tests {
             &"0".repeat(64),
             &epoch,
             None,
+            GpuEvidenceSource::CollectLive { nonce: None },
         )
         .expect("bundle");
 
@@ -249,6 +319,7 @@ mod tests {
             &"0".repeat(64),
             &epoch_claims("epoch-a"),
             None,
+            GpuEvidenceSource::CollectLive { nonce: None },
         )
         .expect("bundle");
 
@@ -259,6 +330,27 @@ mod tests {
             match_epoch_evidence(&claims, &subject(&other, &h)).unwrap_err(),
             EpochEvidenceError::EpochMismatch
         );
+    }
+
+    #[test]
+    fn epoch_bundle_reuses_supplied_gpu_evidence_bytes() {
+        let dir = TempDir::new().unwrap();
+        // Drop stub so resolve_gpu_evidence does not rewrite Reuse → not_applicable.
+        let mut env = stub_env();
+        env.remove("TEECHAT_ENGINE_STUB");
+        env.insert("TEECHAT_ENGINE_ALLOW_MOCK_ATTEST_ON_SNP".into(), "1".into());
+        let reused = "reused-gpu-evidence-bytes-v1".to_string();
+        let bundle = build_engine_epoch_attestation_bundle(
+            &env,
+            dir.path(),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            &"0".repeat(64),
+            &epoch_claims("epoch-a"),
+            None,
+            GpuEvidenceSource::Reuse(reused.clone()),
+        )
+        .expect("bundle");
+        assert_eq!(bundle.gpu_tee.evidence, reused);
     }
 
     #[test]
