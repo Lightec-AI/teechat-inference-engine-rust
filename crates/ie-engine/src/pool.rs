@@ -72,6 +72,16 @@ pub struct PoolScaleResult {
     pub reason: Option<String>,
 }
 
+/// Source sessions that still have an in-flight chat after a replacement was
+/// dialed onto the migration target.
+#[derive(Clone)]
+struct MigrationHold {
+    target_url: String,
+    pending_source: Vec<String>,
+    /// Half-migrate keeps the source plane warm until the chosen chats finish.
+    keep_source: bool,
+}
+
 #[derive(Default)]
 struct PoolState {
     slots: Vec<SessionSlot>,
@@ -118,6 +128,8 @@ pub struct SupervisedPool {
     connect_throttle: Arc<PoolConnectThrottle>,
     state: RwLock<PoolState>,
     watch_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
+    /// Set while busy source chats still overlap sessions dialed onto the target.
+    migration_hold: RwLock<Option<MigrationHold>>,
 }
 
 pub struct SupervisedPoolHandle {
@@ -150,6 +162,7 @@ impl SupervisedPool {
             )),
             state: RwLock::new(PoolState::default()),
             watch_task: RwLock::new(None),
+            migration_hold: RwLock::new(None),
         }
     }
 
@@ -740,12 +753,31 @@ impl SupervisedPool {
         fraction: Option<f64>,
     ) -> Result<PoolDrainResult, EngineError> {
         let current = self.live_session_count().await;
+        if self.migration_keep_source().await {
+            return Ok(PoolDrainResult {
+                drained: 0,
+                remaining: current,
+                target_remaining: current,
+                blocked: true,
+                reason: Some("migration_hold".into()),
+            });
+        }
+        let protected_target = self.migration_target_protected().await;
         let idle_ids = self.idle_session_ids().await;
-        let idle = idle_ids.len() as u32;
+        let mut candidates = Vec::new();
+        for session_id in idle_ids {
+            if let Some(target) = protected_target.as_deref() {
+                if self.session_gateway_url(&session_id).await.as_deref() == Some(target) {
+                    continue;
+                }
+            }
+            candidates.push(session_id);
+        }
+        let idle = candidates.len() as u32;
         let plan = plan_pool_drain(self.config.pool_target_size, current, fraction, count, idle);
 
         let mut drained = 0u32;
-        for session_id in idle_ids.into_iter().take(plan.to_drain as usize) {
+        for session_id in candidates.into_iter().take(plan.to_drain as usize) {
             // TS drainSlotAt: stop pull worker, then disconnect, then remove slot.
             if self.session_is_busy(&session_id).await {
                 continue;
@@ -777,11 +809,12 @@ impl SupervisedPool {
         })
     }
 
-    /// Make-before-break gateway migration: dial target first, then disconnect source.
+    /// Make-before-break gateway migration.
     ///
-    /// Busy SOURCE handlers (ops-control work-pull) cannot move themselves. After idle
-    /// moves, defer those sessions onto TARGET once the work-pull is idle so a flip
-    /// does not leave a leftover dispatcher ESTAB on SOURCE (TS `aea2314`).
+    /// `fraction` of the logical pool is dialed onto `target_url` immediately.
+    /// Idle source sessions are redialed in place. A busy source session stays up
+    /// for the chat it is already serving; a replacement is dialed now, and that
+    /// source session is disconnected only after its own worker goes idle.
     pub async fn migrate_gateway_pool(
         self: &Arc<Self>,
         target_url: &str,
@@ -796,68 +829,101 @@ impl SupervisedPool {
         *self.gateway_base_url.write().await = normalized.clone();
         self.connector.set_primary_gateway_url(&normalized).await;
 
+        self.prune_migration_hold().await;
+        let pending = self
+            .migration_hold
+            .read()
+            .await
+            .as_ref()
+            .map(|h| h.pending_source.len() as u32)
+            .unwrap_or(0);
+        let held: Vec<String> = self
+            .migration_hold
+            .read()
+            .await
+            .as_ref()
+            .map(|h| h.pending_source.clone())
+            .unwrap_or_default();
+
         let state = self.state.read().await;
-        let pool_size = state.slots.len() as u32;
         let on_target = state
             .slots
             .iter()
             .filter(|s| s.session.gateway_base_url == normalized)
             .count() as u32;
+        let source_ids: Vec<String> = state
+            .slots
+            .iter()
+            .filter(|s| s.session.gateway_base_url != normalized)
+            .map(|s| s.session.session_id.clone())
+            .collect();
         drop(state);
 
-        let source_ids: Vec<String> = {
-            let state = self.state.read().await;
-            state
-                .slots
-                .iter()
-                .filter(|s| s.session.gateway_base_url != normalized)
-                .map(|s| s.session.session_id.clone())
-                .collect()
-        };
-        let mut idle_on_source = 0u32;
-        let mut busy_source_ids = Vec::new();
+        let source_count = source_ids.len() as u32;
+        let logical = source_count + on_target - pending.min(source_count + on_target);
+        let plan = plan_gateway_migration(logical, on_target, fraction);
+        if plan.blocked {
+            return Ok(GatewayMigrationResult {
+                moved: 0,
+                on_target,
+                on_source: source_count,
+                target_count: plan.target_count,
+                blocked: true,
+                reason: plan.reason,
+            });
+        }
+
+        let mut idle_ids = Vec::new();
+        let mut busy_ids = Vec::new();
         for id in &source_ids {
+            if held.iter().any(|h| h == id) {
+                continue;
+            }
             if self.session_is_busy(id).await {
-                busy_source_ids.push(id.clone());
+                busy_ids.push(id.clone());
             } else {
-                idle_on_source += 1;
+                idle_ids.push(id.clone());
             }
         }
-        let plan = plan_gateway_migration(pool_size, on_target, fraction, idle_on_source);
 
         let mut moved = 0u32;
-        for _ in 0..plan.to_move {
-            let candidates: Vec<String> = {
-                let state = self.state.read().await;
-                state
-                    .slots
-                    .iter()
-                    .filter(|s| s.session.gateway_base_url != normalized)
-                    .map(|s| s.session.session_id.clone())
-                    .collect()
-            };
-            let mut found = None;
-            for sid in candidates {
-                if !self.session_is_busy(&sid).await {
-                    found = Some(sid);
-                    break;
-                }
-            }
-            let Some(old_session_id) = found else {
+        let mut need = plan.to_move;
+        for id in idle_ids {
+            if need == 0 {
                 break;
-            };
-
-            self.migrate_session_to(&old_session_id, &normalized)
-                .await?;
+            }
+            self.migrate_session_to(&id, &normalized).await?;
             moved += 1;
+            need -= 1;
         }
 
+        let planned: Vec<String> = busy_ids.into_iter().take(need as usize).collect();
+        let keep_source = fraction < 1.0;
+        if !planned.is_empty() {
+            self.arm_migration_hold(&normalized, planned.clone(), keep_source)
+                .await;
+        }
+        let mut ready = Vec::new();
+        for id in &planned {
+            if let Err(err) = self.dial_session_onto(&normalized).await {
+                if ready.is_empty() {
+                    *self.migration_hold.write().await = None;
+                } else {
+                    self.arm_migration_hold(&normalized, ready.clone(), keep_source)
+                        .await;
+                    self.spawn_deferred_source_retire(ready);
+                }
+                return Err(err);
+            }
+            ready.push(id.clone());
+            moved += 1;
+        }
+        if !ready.is_empty() {
+            self.spawn_deferred_source_retire(ready);
+        }
         if moved > 0 {
             self.notify_sessions_changed().await;
         }
-
-        // Fire-and-forget: awaiting here would deadlock the busy ops-control handler.
-        self.spawn_deferred_source_vacate(normalized.clone(), busy_source_ids);
 
         let state = self.state.read().await;
         let final_on_target = state
@@ -872,65 +938,182 @@ impl SupervisedPool {
             on_target: final_on_target,
             on_source,
             target_count: plan.target_count,
-            blocked: plan.blocked && moved < plan.to_move,
-            reason: plan.reason,
+            blocked: false,
+            reason: None,
         })
     }
 
-    fn spawn_deferred_source_vacate(self: &Arc<Self>, target: String, handler_ids: Vec<String>) {
-        if handler_ids.is_empty() {
+    async fn migration_keep_source(&self) -> bool {
+        self.migration_hold
+            .read()
+            .await
+            .as_ref()
+            .map(|h| h.keep_source && !h.pending_source.is_empty())
+            .unwrap_or(false)
+    }
+
+    async fn migration_target_protected(&self) -> Option<String> {
+        self.migration_hold.read().await.as_ref().and_then(|h| {
+            if h.pending_source.is_empty() {
+                None
+            } else {
+                Some(h.target_url.clone())
+            }
+        })
+    }
+
+    async fn session_gateway_url(&self, session_id: &str) -> Option<String> {
+        self.state.read().await.slots.iter().find_map(|s| {
+            if s.session.session_id == session_id {
+                Some(s.session.gateway_base_url.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    async fn prune_migration_hold(&self) {
+        let snapshot: Vec<(String, String)> = self
+            .state
+            .read()
+            .await
+            .slots
+            .iter()
+            .map(|s| (s.session.session_id.clone(), s.session.gateway_base_url.clone()))
+            .collect();
+        let mut hold = self.migration_hold.write().await;
+        let Some(h) = hold.as_mut() else {
             return;
+        };
+        let target = h.target_url.clone();
+        h.pending_source
+            .retain(|id| snapshot.iter().any(|(sid, url)| sid == id && url != &target));
+        if h.pending_source.is_empty() {
+            *hold = None;
         }
-        info!(
-            count = handler_ids.len(),
-            target = %target,
-            "defer SOURCE ops-control vacate onto TARGET"
-        );
-        let pool = Arc::clone(self);
-        tokio::spawn(async move {
-            pool.vacate_busy_source_handlers(target, handler_ids).await;
+    }
+
+    async fn arm_migration_hold(&self, target: &str, pending: Vec<String>, keep_source: bool) {
+        *self.migration_hold.write().await = Some(MigrationHold {
+            target_url: target.to_string(),
+            pending_source: pending,
+            keep_source,
         });
     }
 
-    async fn vacate_busy_source_handlers(&self, target: String, handler_ids: Vec<String>) {
-        'outer: loop {
+    async fn forget_migration_pending(&self, session_id: &str) {
+        let mut hold = self.migration_hold.write().await;
+        if let Some(h) = hold.as_mut() {
+            h.pending_source.retain(|id| id != session_id);
+            if h.pending_source.is_empty() {
+                *hold = None;
+            }
+        }
+    }
+
+    async fn dial_session_onto(&self, gateway_base_url: &str) -> Result<(), EngineError> {
+        let template = self.connect_template.read().await.clone().ok_or_else(|| {
+            EngineError::Connect("no connect template; boot the pool first".into())
+        })?;
+        let mut req = template;
+        req.session_id = uuid::Uuid::new_v4().to_string();
+        req.gateway_challenge_nonce =
+            Some(crate::plane::generate_gateway_connect_challenge_nonce());
+        let req = self.apply_fresh_attestation(req).await?;
+        *self.connect_template.write().await = Some(req.clone());
+        let conn = match self.throttled_connect_to(gateway_base_url, req).await {
+            Ok(r) => r,
+            Err(err) => {
+                warn!(error = %err, target = %gateway_base_url, "migrate dial-ahead failed");
+                return Err(EngineError::Connect(err.to_string()));
+            }
+        };
+        let session_id = conn.session_id.clone();
+        self.state.write().await.slots.push(SessionSlot {
+            session: PoolSession {
+                session_id: session_id.clone(),
+                gateway_base_url: gateway_base_url.to_string(),
+            },
+            ..SessionSlot::default()
+        });
+        if let Err(err) = self.invoke_session_ready(&session_id).await {
+            warn!(session_id = %session_id, error = %err, "migrate dial-ahead epoch failed");
+        }
+        if let Err(err) = self.workers.ensure_started(&session_id).await {
+            warn_pull_worker_start(&session_id, &err);
+        }
+        Ok(())
+    }
+
+    fn spawn_deferred_source_retire(self: &Arc<Self>, source_ids: Vec<String>) {
+        if source_ids.is_empty() {
+            return;
+        }
+        info!(
+            count = source_ids.len(),
+            "defer SOURCE retire after in-flight work"
+        );
+        let pool = Arc::clone(self);
+        tokio::spawn(async move {
+            pool.retire_source_when_idle(source_ids).await;
+        });
+    }
+
+    async fn retire_source_when_idle(&self, source_ids: Vec<String>) {
+        let mut pending = source_ids;
+        while !pending.is_empty() {
             if self.closed.load(Ordering::SeqCst) {
                 return;
             }
-            let mut pending_busy = false;
-            for id in &handler_ids {
-                if self.session_on_source(id, &target).await && self.session_is_busy(id).await {
-                    pending_busy = true;
-                    break;
-                }
-            }
-            if pending_busy {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                continue;
-            }
-            for id in &handler_ids {
-                if self.closed.load(Ordering::SeqCst) {
-                    return;
-                }
-                if !self.session_on_source(id, &target).await {
+            let mut still = Vec::new();
+            for id in pending {
+                if !self.session_on_source_of_primary(&id).await {
+                    self.forget_migration_pending(&id).await;
                     continue;
                 }
-                if self.session_is_busy(id).await {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                    continue 'outer;
+                if self.session_is_busy(&id).await {
+                    still.push(id);
+                    continue;
                 }
-                if let Err(err) = self.migrate_session_to(id, &target).await {
-                    warn!(
-                        session_id = %id,
-                        error = %err,
-                        "deferred SOURCE vacate failed; retry"
-                    );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue 'outer;
-                }
+                self.retire_session(&id).await;
             }
-            self.notify_sessions_changed().await;
+            pending = still;
+            if !pending.is_empty() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+
+    async fn session_on_source_of_primary(&self, session_id: &str) -> bool {
+        let primary = self.gateway_base_url.read().await.clone();
+        self.session_on_source(session_id, &primary).await
+    }
+
+    async fn retire_session(&self, session_id: &str) {
+        if self.session_is_busy(session_id).await {
             return;
+        }
+        self.suppress_reconnect(session_id).await;
+        self.workers.stop_session(session_id).await;
+        if let Err(err) = self.connector.disconnect(session_id).await {
+            warn!(session_id = %session_id, error = %err, "disconnect failed during migrate retire");
+        }
+        let removed = {
+            let mut state = self.state.write().await;
+            if let Some(index) = state
+                .slots
+                .iter()
+                .position(|s| s.session.session_id == session_id)
+            {
+                state.slots.remove(index);
+                true
+            } else {
+                false
+            }
+        };
+        self.forget_migration_pending(session_id).await;
+        if removed {
+            self.notify_sessions_changed().await;
         }
     }
 
@@ -1371,7 +1554,8 @@ mod tests {
             .migrate_gateway_pool("https://gateway-new", 1.0)
             .await
             .unwrap();
-        assert_eq!(result.moved, 0);
+        assert_eq!(result.moved, 1);
+        assert!(!result.blocked);
         assert_eq!(pool.gateway_base_url().await, "https://gateway-new");
         assert_eq!(
             connector.primary.lock().await.as_str(),
@@ -1379,7 +1563,7 @@ mod tests {
         );
         let counts = pool.sessions_by_gateway_url().await;
         assert_eq!(counts.get("https://gateway-old").copied().unwrap_or(0), 1);
-        assert_eq!(counts.get("https://gateway-new").copied().unwrap_or(0), 0);
+        assert_eq!(counts.get("https://gateway-new").copied().unwrap_or(0), 1);
     }
 
     #[tokio::test]
@@ -1407,7 +1591,8 @@ mod tests {
             .migrate_gateway_pool("https://gateway-new", 1.0)
             .await
             .unwrap();
-        assert_eq!(result.moved, 0);
+        assert_eq!(result.moved, 1);
+        assert_eq!(result.on_target, 1);
         assert_eq!(result.on_source, 1);
 
         pool.set_session_busy(&ids[0], false).await;
@@ -1422,6 +1607,67 @@ mod tests {
             }
             if tokio::time::Instant::now() > deadline {
                 panic!("timed out waiting for deferred SOURCE vacate; counts={counts:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        pool.close_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrate_dials_target_while_every_session_is_busy() {
+        let pool = test_pool(
+            SupervisedPoolConfig {
+                pool_target_size: 4,
+                pool_initial_fraction: 1.0,
+                pool_initial_fraction_explicit: true,
+                pool_baseline: 4,
+                supervised: true,
+                reconnect: PoolReconnectConfig::default(),
+            },
+            "https://gateway-old",
+            Arc::new(MockConnector),
+        );
+        pool.boot(sample_request()).await.unwrap();
+        let ids = pool.session_ids().await;
+        assert_eq!(ids.len(), 4);
+        for id in &ids {
+            pool.set_session_busy(id, true).await;
+        }
+        let result = pool
+            .migrate_gateway_pool("https://gateway-new", 0.5)
+            .await
+            .unwrap();
+        assert_eq!(result.moved, 2);
+        assert!(!result.blocked);
+        assert!(result.reason.is_none());
+        assert_eq!(result.on_target, 2);
+        assert_eq!(result.on_source, 4);
+
+        let drained = pool.drain_idle_sessions(4).await.unwrap();
+        assert_eq!(drained.drained, 0);
+        assert_eq!(drained.reason.as_deref(), Some("migration_hold"));
+
+        let again = pool
+            .migrate_gateway_pool("https://gateway-new", 0.5)
+            .await
+            .unwrap();
+        assert_eq!(again.moved, 0);
+        assert_eq!(again.on_target, 2);
+        assert_eq!(again.on_source, 4);
+
+        for id in pool.session_ids().await {
+            pool.set_session_busy(&id, false).await;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let counts = pool.sessions_by_gateway_url().await;
+            if counts.get("https://gateway-new").copied().unwrap_or(0) == 2
+                && counts.get("https://gateway-old").copied().unwrap_or(0) == 2
+            {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("timed out waiting for half-migrate retire; counts={counts:?}");
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

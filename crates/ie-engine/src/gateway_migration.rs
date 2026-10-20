@@ -16,11 +16,13 @@ pub struct GatewayMigrationRequest {
     pub fraction: f64,
 }
 
+/// Sessions that must sit on the migration target. Idle count is not an input:
+/// busy chats stay on the source until they finish, and the caller dials
+/// replacements onto the target immediately.
 pub fn plan_gateway_migration(
     pool_size: u32,
     on_target: u32,
     fraction: f64,
-    idle_on_source: u32,
 ) -> GatewayMigrationPlan {
     if pool_size < 1 {
         return GatewayMigrationPlan {
@@ -39,26 +41,9 @@ pub fn plan_gateway_migration(
         };
     }
     let target_count = ((pool_size as f64) * fraction).floor() as u32;
-    let need = target_count.saturating_sub(on_target);
-    if need == 0 {
-        return GatewayMigrationPlan {
-            target_count,
-            to_move: 0,
-            blocked: false,
-            reason: None,
-        };
-    }
-    if idle_on_source < need {
-        return GatewayMigrationPlan {
-            target_count,
-            to_move: idle_on_source,
-            blocked: true,
-            reason: Some("insufficient_idle_sessions".into()),
-        };
-    }
     GatewayMigrationPlan {
         target_count,
-        to_move: need,
+        to_move: target_count.saturating_sub(on_target),
         blocked: false,
         reason: None,
     }
@@ -84,17 +69,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plan_gateway_migration_moves_idle_sessions() {
-        let plan = plan_gateway_migration(4, 0, 0.5, 4);
+    fn plan_gateway_migration_half_of_four() {
+        let plan = plan_gateway_migration(4, 0, 0.5);
         assert_eq!(plan.target_count, 2);
         assert_eq!(plan.to_move, 2);
+        assert!(!plan.blocked);
+        assert!(plan.reason.is_none());
+    }
+
+    #[test]
+    fn plan_gateway_migration_does_not_require_idle_sessions() {
+        let plan = plan_gateway_migration(4, 0, 1.0);
+        assert_eq!(plan.to_move, 4);
         assert!(!plan.blocked);
     }
 
     #[test]
-    fn plan_gateway_migration_blocks_when_idle_insufficient() {
-        let plan = plan_gateway_migration(4, 0, 1.0, 2);
-        assert_eq!(plan.to_move, 2);
-        assert!(plan.blocked);
+    fn plan_gateway_migration_counts_sessions_already_on_target() {
+        let plan = plan_gateway_migration(4, 2, 0.5);
+        assert_eq!(plan.to_move, 0);
+        assert!(!plan.blocked);
     }
 }
